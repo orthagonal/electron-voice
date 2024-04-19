@@ -20,6 +20,12 @@ use cpal::{
 };
 use dasp::{sample::ToSample, Sample};
 
+use serde_json::Result;
+#[derive(serde::Serialize, serde::Deserialize)]
+struct VoskPartialResult {
+    partial: String,
+}
+
 // some vosk stubs
 enum VoskModel {}
 enum VoskRecognizer {}
@@ -27,6 +33,7 @@ enum VoskRecognizer {}
 // controls the thread state:
 struct AppState {
     is_running: bool,
+    needs_reset: bool,
     name_of_mic: String,
     path_to_model: String,
     sample_rate: f32,
@@ -37,6 +44,8 @@ impl AppState {
         AppState {
             // used to start/stop the thread
             is_running: false,
+            // flag to send when the recognizer needs to be reset
+            needs_reset: false, 
             // the name of the microphone to listen to
             name_of_mic: String::from("default"),
             // the path to the file containing the vosk model
@@ -88,7 +97,6 @@ fn list_devices(mut cx: FunctionContext) -> JsResult<JsArray> {
         let name = device.name().unwrap();
         let js_string = cx.string(name);
         js_array.set(&mut cx, device_index as u32, js_string)?;
-        println!("Device {}: {}", device_index, device.name().unwrap());
     }
     Ok(js_array)
 }
@@ -124,8 +132,14 @@ fn start_listener(mut cx: FunctionContext) -> JsResult<JsUndefined> {
     let channel = cx.channel();
     let (transmit_audio_channel, receive_audio_channel) = std::sync::mpsc::channel();
     let (transmit_words_channel, receive_words_channel) = std::sync::mpsc::channel();
+    // let (transmit_all_words_channel, receive_all_words_channel) = std::sync::mpsc::channel();
+
     let on_words_found_callback = cx.argument::<JsFunction>(0)?.root(&mut cx);
+    let all_words_callback = cx.argument::<JsFunction>(1)?.root(&mut cx);
+    let max_words = cx.argument::<JsNumber>(2)?.value(&mut cx) as usize;
+
     let callback_shared = Arc::new(on_words_found_callback);
+    let all_words_callback_shared = Arc::new(all_words_callback);
     let channel_shared = Arc::new(channel);
 
     // start the producer thread, this thread opens and listens to your microphone
@@ -149,7 +163,7 @@ fn start_listener(mut cx: FunctionContext) -> JsResult<JsUndefined> {
             state.sample_rate = sample_rate;
             state.is_running = true;
         }
-        println!("set to Sample rate: {:?}", sample_rate);
+        // println!("set to Sample rate: {:?}", sample_rate);
         let tx_clone = transmit_audio_channel.clone();
         let mut reported = false;
         let stream = device
@@ -158,7 +172,6 @@ fn start_listener(mut cx: FunctionContext) -> JsResult<JsUndefined> {
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
                     if !reported {
                         reported = true;
-                        println!("Captured audio data: {:?}", &data[..10]); // Print first 10 samples
                     }
                     let data16 = match sample_format {
                         SampleFormat::F32 => convert_f32_to_16(data),
@@ -186,49 +199,35 @@ fn start_listener(mut cx: FunctionContext) -> JsResult<JsUndefined> {
             set_max_alternatives(recognizer, 1);
             set_words(recognizer, 1);
     
-            while APP_STATE.lock().is_running {
+            while APP_STATE.lock().is_running {   
                 std::thread::sleep(std::time::Duration::from_secs(5));
                 {
                     let words_to_look_for = WORDS_TO_LOOK_FOR.lock().unwrap();
                     let words_copy = words_to_look_for.words.clone();
-                    println!("binary is Looking for words: {:?}", words_copy);
                 } // Lock guard is dropped here
-                // println!("Looking for words: {:?}", words_to_look_for.words);
                 for data in &receive_audio_channel {
                     // println!("Received audio data: {:?}", &data[..10]); // Print first 10 samples
                     recognizer_accept_waveform_s(recognizer, &data);
                     let result = recognizer_partial_result(recognizer);
-                    let result_copy = result.clone();
-                    // println!("Partial result: {:?}", result_copy);
-                    let mut words_to_look_for = WORDS_TO_LOOK_FOR.lock().unwrap();
-                    let is_active = words_to_look_for.is_active;
-                    let match_all_words = words_to_look_for.match_all_words;
-                    let words = words_to_look_for.words.clone();
-                    let words_copy = words.clone();
-                    // println!("Looking for words: {:?}", words_copy);
-                    if is_active {
-                        // if we're matching all words we have to match every word in the sentence
-                        if match_all_words {
-                            let mut found_all_words = true;
-                            for word in words {
-                                if !result.contains(&word) {
-                                    found_all_words = false;
-                                    break;
+                    match serde_json::from_str::<VoskPartialResult>(&result) {
+                        Ok(json) => {
+                            // Successfully parsed JSON, now access `partial`
+                            // println!("Partial result: {:?}", json.partial);
+                            let mut words_to_look_for = WORDS_TO_LOOK_FOR.lock().unwrap();
+                            let is_active = words_to_look_for.is_active;
+                            if is_active {
+                                let words: Vec<String> = json.partial.split_whitespace().map(String::from).collect();
+                                transmit_words_channel.send(words.clone()).expect("Failed to send words");
+                                if words.len() > max_words {
+                                    reset_recognizer(recognizer);
                                 }
                             }
-                            if found_all_words {
-                                transmit_words_channel.send(words_to_look_for.words.clone()).expect("Failed to send words");
-                                words_to_look_for.is_active = false;
-                            }
-                        } else {
-                            for word in words {
-                                if result.contains(&word) {
-                                    transmit_words_channel.send(vec![word.clone()]).expect("Failed to send words");
-                                    words_to_look_for.is_active = false;
-                                }
-                            }
+                        },
+                        Err(e) => {
+                            // Handle JSON parsing errors
+                            println!("Error parsing JSON: {}", e);
                         }
-                    } // lock guard is dropped here
+                    }
                 }
             }
             let final_result = recognizer_result(recognizer);
@@ -236,25 +235,37 @@ fn start_listener(mut cx: FunctionContext) -> JsResult<JsUndefined> {
         });
         stream.play().unwrap();
 
+        // this is the loop that looks for recognized words and calls the js callback if found
         while APP_STATE.lock().is_running {
-            std::thread::sleep(std::time::Duration::from_secs(1));
+            std::thread::sleep(std::time::Duration::from_millis(250));
             for wordlist in &receive_words_channel {
-                println!("Received words CHANNEL: {:?}", wordlist);
-                let cb_clone = Arc::clone(&callback_shared);
+                // println!("received wordlist {:?}", wordlist);
+                let cb_clone = Arc::clone(&all_words_callback_shared);
                 let ch_clone = Arc::clone(&channel_shared);
-                print!("calling the clone");
+
                 ch_clone.send(move |mut cx| {
                     let callback = cb_clone.to_inner(&mut cx);
                     let this = cx.undefined();
-                    // turn the words array into a js array of js strings
                     let mut args = vec![];
-                    for word in wordlist {
-                        args.push(cx.string(word).upcast::<JsValue>());
+                    let mut js_array = JsArray::new(&mut cx, wordlist.len() as usize); 
+                    for (i,word) in wordlist.iter().enumerate() {
+                        let string = cx.string(word);
+                        js_array.set(&mut cx, i as u32, string).unwrap(); 
                     }
-                    println!("Calling the callback");
-                    callback.call(&mut cx, this, args).unwrap();
-                    println!("Callback called");
-                    Ok(())
+                    args.push(js_array.upcast::<JsValue>());
+                    match callback.call(&mut cx, this, args) {
+                        Ok(_) => Ok(()),
+                        Err(e) => {
+                            // Handle the error, e.g., log it or send it back to JS
+                            println!("Error calling JavaScript callback: {:?}", e);
+                            Ok(())
+                            // Optionally, you can transform this error into a JavaScript error
+                            // cx.throw_error("Failed to call callback")
+                        }
+                    }    
+                    // make this error-proof:
+                    // callback.call(&mut cx, this, args).unwrap();
+                    // Ok(())
                 });
             }
         }
@@ -298,15 +309,13 @@ fn stop_listener(mut cx: FunctionContext) -> JsResult<JsUndefined> {
     Ok(cx.undefined())
 }
 
-
 fn look_for_words(mut cx: FunctionContext) -> JsResult<JsUndefined> {
-    println!("Looking for words on the rust side called");
     let words = cx.argument::<JsArray>(0)?;
-    println!("Words: {:?}", words);
+    // println!("Words: {:?}", words);
     let match_all_words = cx.argument::<JsBoolean>(1)?.value(&mut cx);
-    println!("Match all words: {:?}", match_all_words);
+    // println!("Match all words: {:?}", match_all_words);
     let mut words_to_look_for  = WORDS_TO_LOOK_FOR.lock().unwrap();
-    println!("Words to look for: {:?}", words_to_look_for.words);
+    // println!("Words to look for: {:?}", words_to_look_for.words);
     words_to_look_for.words.clear();
     for i in 0..words.len(&mut cx) {
         let word_handle: Handle<JsString> = words.get(&mut cx, i)?;
@@ -314,7 +323,7 @@ fn look_for_words(mut cx: FunctionContext) -> JsResult<JsUndefined> {
     }
     words_to_look_for.match_all_words = match_all_words;
     words_to_look_for.is_active = true;
-    println!("Looking for words: {:?}", words_to_look_for.words);
+    // println!("Looking for words: {:?}", words_to_look_for.words);
     Ok(cx.undefined())
 }
 
@@ -376,6 +385,7 @@ extern "C" {
     fn vosk_recognizer_partial_result(recognizer: *mut VoskRecognizer) -> *const c_char;
     fn vosk_recognizer_set_max_alternatives(recognizer: *mut VoskRecognizer, max_alternatives: c_int) -> i32;
     fn vosk_recognizer_set_words(recognizer: *mut VoskRecognizer, words: c_int) -> i32;
+    fn vosk_recognizer_reset(recognizer: *mut VoskRecognizer);
     // fn vosk_recognizer_set_partial_words(recognizer: *mut VoskRecognizer, words: c_int) -> i32;
 }
 
@@ -385,6 +395,10 @@ fn set_max_alternatives(recognizer: *mut VoskRecognizer, max_alternatives: c_int
 
 fn set_words(recognizer: *mut VoskRecognizer, words: c_int) -> i32 {
     unsafe { vosk_recognizer_set_words(recognizer, words) }
+}
+
+fn reset_recognizer(recognizer: *mut VoskRecognizer) {
+    unsafe { vosk_recognizer_reset(recognizer) }
 }
 
 // fn set_partial_words(recognizer: *mut VoskRecognizer, words: c_int) -> i32 {

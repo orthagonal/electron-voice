@@ -859,6 +859,7 @@ dependencies = [
  "lazy_static",
  "neon",
  "parking_lot",
+ "serde",
  "serde_json",
 ]
 
