@@ -33,6 +33,7 @@ enum VoskRecognizer {}
 // controls the thread state:
 struct AppState {
     is_running: bool,
+    model_is_loaded: bool,
     needs_reset: bool,
     name_of_mic: String,
     path_to_model: String,
@@ -44,6 +45,7 @@ impl AppState {
         AppState {
             // used to start/stop the thread
             is_running: false,
+            model_is_loaded: false,
             // flag to send when the recognizer needs to be reset
             needs_reset: false, 
             // the name of the microphone to listen to
@@ -66,7 +68,7 @@ struct WordsToLookFor {
 impl WordsToLookFor {
     fn new() -> Self {
         WordsToLookFor {
-            is_active: false,
+            is_active: true,
             match_all_words: false,
             words: Vec::new(),
         }
@@ -196,6 +198,10 @@ fn start_listener(mut cx: FunctionContext) -> JsResult<JsUndefined> {
             };
             let model = new_vosk_model(&path_to_model);
             let recognizer = new_vosk_recognizer(model, sample_rate);
+            {
+                let mut state = APP_STATE.lock();
+                state.model_is_loaded = true;
+            }
             set_max_alternatives(recognizer, 1);
             set_words(recognizer, 1);
     
@@ -218,6 +224,7 @@ fn start_listener(mut cx: FunctionContext) -> JsResult<JsUndefined> {
                             if is_active {
                                 let words: Vec<String> = json.partial.split_whitespace().map(String::from).collect();
                                 transmit_words_channel.send(words.clone()).expect("Failed to send words");
+                                // println!("Words: {:?}", words);
                                 if words.len() > max_words {
                                     reset_recognizer(recognizer);
                                 }
@@ -263,9 +270,6 @@ fn start_listener(mut cx: FunctionContext) -> JsResult<JsUndefined> {
                             // cx.throw_error("Failed to call callback")
                         }
                     }    
-                    // make this error-proof:
-                    // callback.call(&mut cx, this, args).unwrap();
-                    // Ok(())
                 });
             }
         }
@@ -327,6 +331,11 @@ fn look_for_words(mut cx: FunctionContext) -> JsResult<JsUndefined> {
     Ok(cx.undefined())
 }
 
+fn is_model_loaded(mut cx: FunctionContext) -> JsResult<JsBoolean> {
+    let state = APP_STATE.lock();
+    Ok(JsBoolean::new(&mut cx, state.model_is_loaded))
+}
+
 // all of the functions defined here are exposed to nodejs when you import this index.node module
 // eg:
 // const { setLogLevel, startListener, stopListener, listDevices, setMicName, setPathToModel, setSampleRate } = require('index.node');
@@ -341,6 +350,7 @@ fn main(mut cx: ModuleContext) -> NeonResult<()> {
     cx.export_function("setMicName", set_mic_name)?;
     cx.export_function("setPathToModel", set_path_to_model)?;
     cx.export_function("lookForWords", look_for_words)?;
+    cx.export_function("isModelLoaded", is_model_loaded)?;
     Ok(())
 }
 
