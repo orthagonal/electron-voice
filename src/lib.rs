@@ -245,7 +245,7 @@ fn start_listener(mut cx: FunctionContext) -> JsResult<JsUndefined> {
                         Ok(json) => {
                             // Successfully parsed JSON, now access `partial`
                             // println!("Partial result: {:?}", json.partial);
-                            let mut words_to_look_for = WORDS_TO_LOOK_FOR.lock().unwrap();
+                            let words_to_look_for = WORDS_TO_LOOK_FOR.lock().unwrap();
                             let is_active = words_to_look_for.is_active;
                             if is_active {
                                 let words: Vec<String> = json.partial.split_whitespace().map(String::from).collect();
@@ -280,7 +280,7 @@ fn start_listener(mut cx: FunctionContext) -> JsResult<JsUndefined> {
                     let callback = cb_clone.to_inner(&mut cx);
                     let this = cx.undefined();
                     let mut args = vec![];
-                    let mut js_array = JsArray::new(&mut cx, wordlist.len() as usize); 
+                    let js_array = JsArray::new(&mut cx, wordlist.len() as usize); 
                     for (i,word) in wordlist.iter().enumerate() {
                         let string = cx.string(word);
                         js_array.set(&mut cx, i as u32, string).unwrap(); 
@@ -392,7 +392,6 @@ This section is bindings to the vosk dynamic library (.so on linux or .dll on wi
 extern "C" {
     fn vosk_set_log_level(level: i32);
     fn vosk_model_new(model_path: *const c_char) -> *mut VoskModel;
-    fn vosk_model_find_word(model: *mut VoskModel, word: *const c_char) -> i32;
     fn vosk_recognizer_new(model: *mut VoskModel, sample_rate: f32) -> *mut VoskRecognizer;
     fn vosk_recognizer_new_grm(
         model: *mut VoskModel,
@@ -400,17 +399,6 @@ extern "C" {
         grammar: *const c_char,
     ) -> *mut VoskRecognizer;
 
-    fn vosk_recognizer_accept_waveform(
-        recognizer: *mut VoskRecognizer,
-        data: *const i32,
-        length: i32,
-    ) -> i32;
-    // not used in this code but might be used in your own project:
-    fn vosk_recognizer_accept_waveform_f(
-        recognizer: *mut VoskRecognizer,
-        data: *const f32,
-        length: i32,
-    ) -> i32;
     fn vosk_recognizer_accept_waveform_s(
         recognizer: *mut VoskRecognizer,
         data: *const i16,
@@ -462,31 +450,13 @@ fn recognizer_new_grm(
     unsafe { vosk_recognizer_new_grm(model, sample_rate, c_grammar.as_ptr()) }
 }
 
-fn recognizer_accept_waveform(recognizer: *mut VoskRecognizer, data: &[i32]) {
-    unsafe {
-        let result = vosk_recognizer_accept_waveform(recognizer, data.as_ptr(), data.len() as i32);
-        // println!("Accept waveform result: {:?}", result)
-    }
-}
-
-fn recognizer_accept_waveform_f(recognizer: *mut VoskRecognizer, data: &[f32]) {
-    unsafe {
-        let result = vosk_recognizer_accept_waveform_f(recognizer, data.as_ptr(), data.len() as i32);
-        // println!("Accept waveform result: {:?}", result)
-    }
-}
-
 fn recognizer_accept_waveform_s(recognizer: *mut VoskRecognizer, data: &[i16]) {
     unsafe {
-        let result = vosk_recognizer_accept_waveform_s(recognizer, data.as_ptr(), data.len() as i32);
+        let _result = vosk_recognizer_accept_waveform_s(recognizer, data.as_ptr(), data.len() as i32);
         // println!("Accept waveform short result: {:?}", result)
     }
 }
 
-fn model_find_word(model: *mut VoskModel, word: &str) -> i32 {
-    let c_word = CString::new(word).expect("CString::new failed");
-    unsafe { vosk_model_find_word(model, c_word.as_ptr()) }
-}
 
 fn recognizer_result(recognizer: *mut VoskRecognizer) -> String {
     let c_result = unsafe { vosk_recognizer_result(recognizer) };
