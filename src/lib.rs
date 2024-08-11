@@ -1,14 +1,12 @@
 // js binding stuff:
 use neon::prelude::*;
 use neon::types::JsFunction;
-use neon::prelude::Channel as NeonChannel;
 
 // c++ binding stuff for the vosk library:
 use std::ffi::{c_char, c_int, CStr, CString};
 // thread control stuff:
 use lazy_static::lazy_static;
 use parking_lot::Mutex;
-use std::sync::mpsc::channel;
 use std::sync::Mutex as StdMutex;
 use std::sync::Arc;
 use std::thread;
@@ -16,11 +14,10 @@ use std::thread;
 // audio input and processing stuff:
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait, },
-    {SampleFormat}
+    SampleFormat
 };
 use dasp::{sample::ToSample, Sample};
 
-use serde_json::Result;
 #[derive(serde::Serialize, serde::Deserialize)]
 struct VoskPartialResult {
     partial: String,
@@ -32,26 +29,32 @@ enum VoskRecognizer {}
 
 // controls the thread state:
 struct AppState {
-    is_running: bool,
+    // audio device is selected and actively pulling in data:
+    is_running: bool, 
+    // vosk model is loaded and ready to process audio:
     model_is_loaded: bool,
-    needs_reset: bool,
+    // name of the audio device to listen to:
     name_of_mic: String,
+    // path to the vosk model file on disk 
+    // (see https://alphacephei.com/vosk/models)
     path_to_model: String,
+    // optional, a grammar is a list of words to expect.
+    // When you pass a grammar in, the model will only look for the words in that grammar.
+    // Use a grammar when you only need recognize specific keywords (i.e. you want a specific voice interface). 
+    // Leave it blank to do general speech-to-text transcription.
+    grammar: String,
+    // sample rate of the device, needed to create the recognizer
     sample_rate: f32,
 }
 
 impl AppState {
     fn new() -> Self {
         AppState {
-            // used to start/stop the thread
             is_running: false,
             model_is_loaded: false,
-            // flag to send when the recognizer needs to be reset
-            needs_reset: false, 
-            // the name of the microphone to listen to
             name_of_mic: String::from("default"),
-            // the path to the file containing the vosk model
             path_to_model: String::from(""),
+            grammar: String::from(""),
             sample_rate: 16000.0,
         }
     }
@@ -76,6 +79,7 @@ impl WordsToLookFor {
 }
 
 // the one true app state
+// these are the global variables that are shared between threads
 lazy_static! {
     static ref APP_STATE: Mutex<AppState> = Mutex::new(AppState::new());
     static ref WORDS_TO_LOOK_FOR: StdMutex<WordsToLookFor> = StdMutex::new(WordsToLookFor::new());
@@ -91,6 +95,7 @@ lazy_static! {
 this section defines functions that you can access from nodejs
 **************************************************************/
 
+// returns a js array listing the audio devices on your system
 fn list_devices(mut cx: FunctionContext) -> JsResult<JsArray> {
     let host = cpal::default_host();
     let devices = host.input_devices().expect("Failed to get input devices");
@@ -103,6 +108,7 @@ fn list_devices(mut cx: FunctionContext) -> JsResult<JsArray> {
     Ok(js_array)
 }
 
+// select an audio device to listen to
 fn set_mic_name(mut cx: FunctionContext) -> JsResult<JsUndefined> {
     let name = cx.argument::<JsString>(0)?.value(&mut cx);
 
@@ -114,11 +120,23 @@ fn set_mic_name(mut cx: FunctionContext) -> JsResult<JsUndefined> {
     Ok(cx.undefined())
 }
 
+// set the file path to the vosk speech model
 fn set_path_to_model(mut cx: FunctionContext) -> JsResult<JsUndefined> {
     let name = cx.argument::<JsString>(0)?.value(&mut cx);
     {
         let mut state = APP_STATE.lock();
         state.path_to_model = name;
+    }
+
+    Ok(cx.undefined())
+}
+
+// grammar is a JSON array of words/phrases in string form  : "[\"hello world\", \"electron\", \"voice\"]"
+fn set_grammar(mut cx: FunctionContext) -> JsResult<JsUndefined> {
+    let grammar = cx.argument::<JsString>(0)?.value(&mut cx);
+    {
+        let mut state = APP_STATE.lock();
+        state.grammar = grammar;
     }
 
     Ok(cx.undefined())
@@ -131,23 +149,20 @@ fn start_listener(mut cx: FunctionContext) -> JsResult<JsUndefined> {
         let state = APP_STATE.lock();
         state.name_of_mic.clone()
     };
+    // one channel receives raw audio data, the other receives recognized words from that audio
     let channel = cx.channel();
     let (transmit_audio_channel, receive_audio_channel) = std::sync::mpsc::channel();
     let (transmit_words_channel, receive_words_channel) = std::sync::mpsc::channel();
-    // let (transmit_all_words_channel, receive_all_words_channel) = std::sync::mpsc::channel();
 
-    let on_words_found_callback = cx.argument::<JsFunction>(0)?.root(&mut cx);
+    // js callback to call when words are found
     let all_words_callback = cx.argument::<JsFunction>(1)?.root(&mut cx);
     let max_words = cx.argument::<JsNumber>(2)?.value(&mut cx) as usize;
 
-    let callback_shared = Arc::new(on_words_found_callback);
     let all_words_callback_shared = Arc::new(all_words_callback);
     let channel_shared = Arc::new(channel);
 
     // start the producer thread, this thread opens and listens to your microphone
     thread::spawn(move || {
-        // get the js stuff to handle invoking the callback defined in node:
-
         let host = cpal::default_host();
         let device = host
             .input_devices()
@@ -159,7 +174,7 @@ fn start_listener(mut cx: FunctionContext) -> JsResult<JsUndefined> {
         let config = device.default_input_config().unwrap();
         let sample_rate = config.sample_rate().0 as f32;
         let sample_format = config.sample_format();
-        // the other thread will need to know the sample_rate when it creates the recognizer
+        // send the audio sample rate to the other thread so it can create a matching speech recognizer
         {
             let mut state = APP_STATE.lock();
             state.sample_rate = sample_rate;
@@ -175,6 +190,8 @@ fn start_listener(mut cx: FunctionContext) -> JsResult<JsUndefined> {
                     if !reported {
                         reported = true;
                     }
+                    // different audio devices use different ways of representing audio data
+                    // a 32-bit float, a 16-bit signed integer, or a 16-bit unsigned integer
                     let data16 = match sample_format {
                         SampleFormat::F32 => convert_f32_to_16(data),
                         SampleFormat::I16 => convert_32_to_16(data),
@@ -190,31 +207,40 @@ fn start_listener(mut cx: FunctionContext) -> JsResult<JsUndefined> {
                 None,
             )
            .unwrap();  
-        // start the consumer thread, this runs the recognizer model
+        // start the consumer thread
+        // this thread takes in the audio from the producer thread and passes it through the 
+        // speech recognizer, then sends back any recognized words
         thread::spawn(move || {
-            let (path_to_model, sample_rate) = {
+            let (grammar, path_to_model, sample_rate) = {
                 let state = APP_STATE.lock();
-                (state.path_to_model.clone(), state.sample_rate)
+                (state.grammar.clone(), state.path_to_model.clone(), state.sample_rate)
             };
             let model = new_vosk_model(&path_to_model);
-            let recognizer = new_vosk_recognizer(model, sample_rate);
+            // create  the speech recognizer, optionally use a grammar to only look for specific words
+            let recognizer;
+            if grammar.len() == 0 {
+                recognizer = new_vosk_recognizer(model, sample_rate);
+            } else {
+                recognizer = recognizer_new_grm(model, sample_rate, &grammar);
+                println!("grammar laoded: {:?}", grammar);
+            }
+            // tell everyone else that the model is loaded and ready to roll
             {
                 let mut state = APP_STATE.lock();
                 state.model_is_loaded = true;
             }
+            // some options for the model
             set_max_alternatives(recognizer, 1);
             set_words(recognizer, 1);
     
             while APP_STATE.lock().is_running {   
                 std::thread::sleep(std::time::Duration::from_secs(5));
-                {
-                    let words_to_look_for = WORDS_TO_LOOK_FOR.lock().unwrap();
-                    let words_copy = words_to_look_for.words.clone();
-                } // Lock guard is dropped here
                 for data in &receive_audio_channel {
                     // println!("Received audio data: {:?}", &data[..10]); // Print first 10 samples
+                    // here is where we pass the audio waveform data to the recognizer
                     recognizer_accept_waveform_s(recognizer, &data);
                     let result = recognizer_partial_result(recognizer);
+                    // println!("Partial result: {:?}", result);
                     match serde_json::from_str::<VoskPartialResult>(&result) {
                         Ok(json) => {
                             // Successfully parsed JSON, now access `partial`
@@ -273,7 +299,6 @@ fn start_listener(mut cx: FunctionContext) -> JsResult<JsUndefined> {
                 });
             }
         }
-        // any thread cleanup code goes here
         stream.pause().unwrap();
     });
 
@@ -343,7 +368,6 @@ fn is_model_loaded(mut cx: FunctionContext) -> JsResult<JsBoolean> {
 #[neon::main]
 fn main(mut cx: ModuleContext) -> NeonResult<()> {
     cx.export_function("setLogLevel", set_log_level)?;
-    // cx.export_function("modelNew", model_new)?;
     cx.export_function("startListener", start_listener)?;
     cx.export_function("stopListener", stop_listener)?;
     cx.export_function("listDevices", list_devices)?;
@@ -351,6 +375,7 @@ fn main(mut cx: ModuleContext) -> NeonResult<()> {
     cx.export_function("setPathToModel", set_path_to_model)?;
     cx.export_function("lookForWords", look_for_words)?;
     cx.export_function("isModelLoaded", is_model_loaded)?;
+    cx.export_function("setGrammar", set_grammar)?;
     Ok(())
 }
 
@@ -374,13 +399,13 @@ extern "C" {
         sample_rate: f32,
         grammar: *const c_char,
     ) -> *mut VoskRecognizer;
-    fn vosk_recognizer_set_grm(recognizer: *mut VoskRecognizer, grammar: *const c_char);
 
     fn vosk_recognizer_accept_waveform(
         recognizer: *mut VoskRecognizer,
         data: *const i32,
         length: i32,
     ) -> i32;
+    // not used in this code but might be used in your own project:
     fn vosk_recognizer_accept_waveform_f(
         recognizer: *mut VoskRecognizer,
         data: *const f32,
@@ -396,7 +421,6 @@ extern "C" {
     fn vosk_recognizer_set_max_alternatives(recognizer: *mut VoskRecognizer, max_alternatives: c_int) -> i32;
     fn vosk_recognizer_set_words(recognizer: *mut VoskRecognizer, words: c_int) -> i32;
     fn vosk_recognizer_reset(recognizer: *mut VoskRecognizer);
-    // fn vosk_recognizer_set_partial_words(recognizer: *mut VoskRecognizer, words: c_int) -> i32;
 }
 
 fn set_max_alternatives(recognizer: *mut VoskRecognizer, max_alternatives: c_int) -> i32 {
@@ -410,10 +434,6 @@ fn set_words(recognizer: *mut VoskRecognizer, words: c_int) -> i32 {
 fn reset_recognizer(recognizer: *mut VoskRecognizer) {
     unsafe { vosk_recognizer_reset(recognizer) }
 }
-
-// fn set_partial_words(recognizer: *mut VoskRecognizer, words: c_int) -> i32 {
-//     unsafe { vosk_recognizer_set_partial_words(recognizer, words) }
-// }
 
 // 'safe' wrappers for the vosk library
 fn set_log_level(mut cx: FunctionContext) -> JsResult<JsUndefined> {
@@ -442,11 +462,6 @@ fn recognizer_new_grm(
     unsafe { vosk_recognizer_new_grm(model, sample_rate, c_grammar.as_ptr()) }
 }
 
-fn set_vosk_recognizer_grammar(recognizer: *mut VoskRecognizer, grammar: &str) {
-    let c_grammar = CString::new(grammar).expect("CString::new failed");
-    unsafe { vosk_recognizer_set_grm(recognizer, c_grammar.as_ptr()) }
-}
-
 fn recognizer_accept_waveform(recognizer: *mut VoskRecognizer, data: &[i32]) {
     unsafe {
         let result = vosk_recognizer_accept_waveform(recognizer, data.as_ptr(), data.len() as i32);
@@ -467,7 +482,6 @@ fn recognizer_accept_waveform_s(recognizer: *mut VoskRecognizer, data: &[i16]) {
         // println!("Accept waveform short result: {:?}", result)
     }
 }
-
 
 fn model_find_word(model: *mut VoskModel, word: &str) -> i32 {
     let c_word = CString::new(word).expect("CString::new failed");

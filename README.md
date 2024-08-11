@@ -1,7 +1,9 @@
 # vosk-electron
 
-A complete Node.js library for running Vosk speech recognition in an independent thread
-using Rust, absolutely no compilation required.  
+An electron Node.js library for capturing audio
+and converting it to text using Vosk speech recognition
+models.  
+Audio capture and speech recognition each runs in separate threads from your Electron app, so they are fast and not subject to any security limitations imposed by the browser.
 
 
 This project was bootstrapped by [create-neon](https://www.npmjs.com/package/create-neon).
