@@ -4,7 +4,8 @@ use neon::types::JsFunction;
 
 // c++ binding stuff for the vosk library:
 use std::ffi::{c_char, c_int, CStr, CString};
-// thread control stuff:
+
+// rust thread control stuff:
 use lazy_static::lazy_static;
 use parking_lot::Mutex;
 use std::sync::Mutex as StdMutex;
@@ -40,10 +41,12 @@ struct AppState {
     path_to_model: String,
     // optional, a grammar is a list of words to expect.
     // When you pass a grammar in, the model will only look for the words in that grammar.
-    // Use a grammar when you only need recognize specific keywords (i.e. you want a specific voice interface). 
+    // Use a grammar when you only need recognize a specific set of keywords 
+    // (i.e. you are implementing a voice user interface). 
     // Leave it blank to do general speech-to-text transcription.
     grammar: String,
-    // sample rate of the device, needed to create the recognizer
+    // sample rate of the audio device, you have to know the sample_rate 
+    // before you can initialize the vosk voice recognizer 
     sample_rate: f32,
 }
 
@@ -63,17 +66,12 @@ impl AppState {
 struct WordsToLookFor {
     // whether we're scanning for a word currently
     is_active: bool,
-    // if false, matching any word in the words vec will trigger the callback
-    match_all_words: bool,
-    words: Vec<String>,
 }
 
 impl WordsToLookFor {
     fn new() -> Self {
         WordsToLookFor {
             is_active: true,
-            match_all_words: false,
-            words: Vec::new(),
         }
     }
 }
@@ -82,7 +80,7 @@ impl WordsToLookFor {
 // these are the global variables that are shared between threads
 lazy_static! {
     static ref APP_STATE: Mutex<AppState> = Mutex::new(AppState::new());
-    static ref WORDS_TO_LOOK_FOR: StdMutex<WordsToLookFor> = StdMutex::new(WordsToLookFor::new());
+    static ref LISTEN_FOR_WORDS: StdMutex<WordsToLookFor> = StdMutex::new(WordsToLookFor::new());
 }
 
 /*
@@ -141,6 +139,7 @@ fn set_grammar(mut cx: FunctionContext) -> JsResult<JsUndefined> {
 
     Ok(cx.undefined())
 }
+
 
 // start the listening thread
 fn start_listener(mut cx: FunctionContext) -> JsResult<JsUndefined> {
@@ -236,8 +235,9 @@ fn start_listener(mut cx: FunctionContext) -> JsResult<JsUndefined> {
             while APP_STATE.lock().is_running {   
                 std::thread::sleep(std::time::Duration::from_secs(5));
                 for data in &receive_audio_channel {
-                    // println!("Received audio data: {:?}", &data[..10]); // Print first 10 samples
-                    // here is where we pass the audio waveform data to the recognizer
+                    // println!("Received audio data: {:?}", &data[..10]); 
+                    // here is where we actually pass the audio waveform data to the voice recognizer
+                    // we get the result back as a json string
                     recognizer_accept_waveform_s(recognizer, &data);
                     let result = recognizer_partial_result(recognizer);
                     // println!("Partial result: {:?}", result);
@@ -245,8 +245,8 @@ fn start_listener(mut cx: FunctionContext) -> JsResult<JsUndefined> {
                         Ok(json) => {
                             // Successfully parsed JSON, now access `partial`
                             // println!("Partial result: {:?}", json.partial);
-                            let words_to_look_for = WORDS_TO_LOOK_FOR.lock().unwrap();
-                            let is_active = words_to_look_for.is_active;
+                            let listen_for_words = LISTEN_FOR_WORDS.lock().unwrap();
+                            let is_active = listen_for_words.is_active;
                             if is_active {
                                 let words: Vec<String> = json.partial.split_whitespace().map(String::from).collect();
                                 transmit_words_channel.send(words.clone()).expect("Failed to send words");
@@ -339,20 +339,8 @@ fn stop_listener(mut cx: FunctionContext) -> JsResult<JsUndefined> {
 }
 
 fn look_for_words(mut cx: FunctionContext) -> JsResult<JsUndefined> {
-    let words = cx.argument::<JsArray>(0)?;
-    // println!("Words: {:?}", words);
-    let match_all_words = cx.argument::<JsBoolean>(1)?.value(&mut cx);
-    // println!("Match all words: {:?}", match_all_words);
-    let mut words_to_look_for  = WORDS_TO_LOOK_FOR.lock().unwrap();
-    // println!("Words to look for: {:?}", words_to_look_for.words);
-    words_to_look_for.words.clear();
-    for i in 0..words.len(&mut cx) {
-        let word_handle: Handle<JsString> = words.get(&mut cx, i)?;
-        words_to_look_for.words.push( word_handle.value(&mut cx));
-    }
-    words_to_look_for.match_all_words = match_all_words;
+    let mut words_to_look_for  = LISTEN_FOR_WORDS.lock().unwrap();
     words_to_look_for.is_active = true;
-    // println!("Looking for words: {:?}", words_to_look_for.words);
     Ok(cx.undefined())
 }
 
