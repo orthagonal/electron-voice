@@ -140,8 +140,7 @@ fn set_grammar(mut cx: FunctionContext) -> JsResult<JsUndefined> {
     Ok(cx.undefined())
 }
 
-
-// start the listening thread
+// start the listening and interpreting threads
 fn start_listener(mut cx: FunctionContext) -> JsResult<JsUndefined> {
     // set up the audio
     let desired_input_device_name = {
@@ -221,7 +220,7 @@ fn start_listener(mut cx: FunctionContext) -> JsResult<JsUndefined> {
                 recognizer = new_vosk_recognizer(model, sample_rate);
             } else {
                 recognizer = recognizer_new_grm(model, sample_rate, &grammar);
-                println!("grammar laoded: {:?}", grammar);
+                println!("grammar loaded: {:?}", grammar);
             }
             // tell everyone else that the model is loaded and ready to roll
             {
@@ -328,7 +327,6 @@ fn  convert_stereo_to_mono(input_data: &[i16]) -> Vec<i16> {
 
     result
 }
-
 
 // stop the listening thread
 fn stop_listener(mut cx: FunctionContext) -> JsResult<JsUndefined> {
