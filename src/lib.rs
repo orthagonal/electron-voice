@@ -153,8 +153,8 @@ fn start_listener(mut cx: FunctionContext) -> JsResult<JsUndefined> {
     let (transmit_words_channel, receive_words_channel) = std::sync::mpsc::channel();
 
     // js callback to call when words are found
-    let all_words_callback = cx.argument::<JsFunction>(1)?.root(&mut cx);
-    let max_words = cx.argument::<JsNumber>(2)?.value(&mut cx) as usize;
+    let all_words_callback = cx.argument::<JsFunction>(0)?.root(&mut cx);
+    let max_words = cx.argument::<JsNumber>(1)?.value(&mut cx) as usize;
 
     let all_words_callback_shared = Arc::new(all_words_callback);
     let channel_shared = Arc::new(channel);
