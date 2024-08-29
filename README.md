@@ -51,7 +51,7 @@ voiceModule.setPathToModel('vosk-model-small-en-us-0.15');
 // you can specify a grammar to limit the recognized words and
 // improve accuracy, this step is optional
 voiceModule.setGrammar('["hello", "world"]');
-voiceModule.startListener(trackWordsFound, MAX_WORDS); 
+voiceModule.startListener(onWordsFound, MAX_WORDS); 
 // wait for the model to load, the big ones can take a few minutes:    
 let interval;
 interval = setInterval(() => {
