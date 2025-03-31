@@ -22,15 +22,6 @@ jobs:
       with:
         targets: ${{ matrix.target }}
 
-    - name: Create binaries directory
-      run: mkdir -p electron-voice/binaries
-
-    - name: Download Vosk library
-      run: |
-        cd electron-voice/binaries
-        curl -L -o electron-voice-macos-0.3.45.zip https://github.com/alphacep/vosk-api/releases/download/v0.3.45/vosk-macos-0.3.45.zip
-        unzip electron-voice-macos-0.3.45.zip -d electron-voice-macos-0.3.45
-
     - name: Build library
       run: |
         cd electron-voice
@@ -54,4 +45,4 @@ jobs:
         draft: false
         prerelease: false
       env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} 

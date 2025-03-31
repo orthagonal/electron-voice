@@ -9,12 +9,12 @@ fn main() {
         },
         // macOS targets
         "x86_64-apple-darwin" | "aarch64-apple-darwin" => {
-            println!("cargo:rustc-link-search=native=./binaries/vosk-macos-0.3.45");
+            println!("cargo:rustc-link-search=native=./binaries/darwin");
             println!("cargo:rustc-link-lib=dylib=vosk");
         },
         // Linux targets
         "x86_64-unknown-linux-gnu" => {
-            println!("cargo:rustc-link-search=native=./binaries/vosk-linux-0.3.45");
+            println!("cargo:rustc-link-search=native=./binaries/linux");
             println!("cargo:rustc-link-lib=dylib=vosk");
         },
         _ => {
