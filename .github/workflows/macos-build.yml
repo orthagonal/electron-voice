@@ -34,13 +34,13 @@ jobs:
         cp target/${{ matrix.target }}/release/libelectron_voice.dylib ./Releases/libelectron_voice-${{ matrix.target }}.dylib
 
     - name: Create release
-      if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+      # if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
       uses: softprops/action-gh-release@v1
       with:
         files: |
           Releases/libelectron_voice-x86_64-apple-darwin.dylib
           Releases/libelectron_voice-aarch64-apple-darwin.dylib
-        draft: false
+        draft: true
         prerelease: false
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} 
