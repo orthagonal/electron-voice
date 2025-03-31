@@ -24,7 +24,6 @@ jobs:
 
     - name: Build library
       run: |
-        cd electron-voice
         cargo build --release --target ${{ matrix.target }}
 
     - name: Create release directory
@@ -32,7 +31,6 @@ jobs:
 
     - name: Copy built library
       run: |
-        cd electron-voice
         cp target/${{ matrix.target }}/release/libelectron_voice.dylib ../Releases/libelectron_voice-${{ matrix.target }}.dylib
 
     - name: Create release
