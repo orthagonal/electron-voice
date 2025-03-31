@@ -10,7 +10,7 @@ fn main() {
         // macOS targets
         "x86_64-apple-darwin" | "aarch64-apple-darwin" => {
             println!("cargo:rustc-link-search=native=./binaries/darwin");
-            println!("cargo:rustc-link-lib=dylib=vosk");
+            println!("cargo:rustc-link-lib=dylib=libvosk");
         },
         // Linux targets
         "x86_64-unknown-linux-gnu" => {
