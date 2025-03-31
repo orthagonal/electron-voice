@@ -31,7 +31,7 @@ jobs:
 
     - name: Copy built library
       run: |
-        cp target/${{ matrix.target }}/release/libelectron_voice.dylib ../Releases/libelectron_voice-${{ matrix.target }}.dylib
+        cp target/${{ matrix.target }}/release/libelectron_voice.dylib ./Releases/libelectron_voice-${{ matrix.target }}.dylib
 
     - name: Create release
       if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
