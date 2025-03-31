@@ -1,0 +1,57 @@
+name: Build electron-voice for macOS
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        target: [x86_64-apple-darwin, aarch64-apple-darwin]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ matrix.target }}
+
+    - name: Create binaries directory
+      run: mkdir -p electron-voice/binaries
+
+    - name: Download Vosk library
+      run: |
+        cd electron-voice/binaries
+        curl -L -o electron-voice-macos-0.3.45.zip https://github.com/alphacep/vosk-api/releases/download/v0.3.45/vosk-macos-0.3.45.zip
+        unzip electron-voice-macos-0.3.45.zip -d electron-voice-macos-0.3.45
+
+    - name: Build library
+      run: |
+        cd electron-voice
+        cargo build --release --target ${{ matrix.target }}
+
+    - name: Create release directory
+      run: mkdir -p Releases
+
+    - name: Copy built library
+      run: |
+        cd electron-voice
+        cp target/${{ matrix.target }}/release/libelectron_voice.dylib ../Releases/libelectron_voice-${{ matrix.target }}.dylib
+
+    - name: Create release
+      if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          Releases/libelectron_voice-x86_64-apple-darwin.dylib
+          Releases/libelectron_voice-aarch64-apple-darwin.dylib
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} 
