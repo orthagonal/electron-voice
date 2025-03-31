@@ -309,6 +309,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "11157ac094ffbdde99aa67b23417ebdd801842852b500e395a45a9c0aac03e4a"
 
 [[package]]
+name = "electron-voice"
+version = "0.1.0"
+dependencies = [
+ "cpal",
+ "dasp",
+ "hound",
+ "lazy_static",
+ "neon",
+ "parking_lot",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -848,20 +862,6 @@ name = "unicode-ident"
 version = "1.0.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3354b9ac3fae1ff6755cb6db53683adb661634f67557942dea4facebec0fee4b"
-
-[[package]]
-name = "voice"
-version = "0.1.0"
-dependencies = [
- "cpal",
- "dasp",
- "hound",
- "lazy_static",
- "neon",
- "parking_lot",
- "serde",
- "serde_json",
-]
 
 [[package]]
 name = "walkdir"
