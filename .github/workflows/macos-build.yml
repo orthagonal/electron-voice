@@ -35,6 +35,11 @@ jobs:
       run: |
         cp target/${{ matrix.target }}/release/libelectron_voice.dylib ./Releases/libelectron_voice-${{ matrix.target }}.dylib
 
+    - name: List release files
+      run: |
+        ls -la ./Releases/
+        file ./Releases/*
+
     - name: Create release
       if: startsWith(github.ref, 'refs/tags/')
       uses: softprops/action-gh-release@v1
