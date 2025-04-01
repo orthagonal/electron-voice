@@ -18,6 +18,8 @@ jobs:
       - name: Install dependencies
         run: |
           brew install cmake swig
+          python3 -m venv .venv
+          source .venv/bin/activate
           python3 -m pip install numpy
 
       - name: Clone vosk-api
@@ -26,6 +28,7 @@ jobs:
 
       - name: Build libvosk.dylib
         run: |
+          source .venv/bin/activate
           mkdir -p vosk/build
           cd vosk/build
           cmake -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} ..
