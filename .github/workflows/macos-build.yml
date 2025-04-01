@@ -9,6 +9,9 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: macos-latest
@@ -34,11 +37,6 @@ jobs:
     - name: Copy built library
       run: |
         cp target/${{ matrix.target }}/release/libelectron_voice.dylib ./Releases/libelectron_voice-${{ matrix.target }}.dylib
-
-    - name: List release files
-      run: |
-        ls -la ./Releases/
-        file ./Releases/*
 
     - name: Create release
       if: startsWith(github.ref, 'refs/tags/')
