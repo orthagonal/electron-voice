@@ -6,10 +6,10 @@ on:
 jobs:
   build:
     name: Build on macOS
-    runs-on: macos-14-arm64
+    runs-on: macos-latest
     strategy:
       matrix:
-        arch: [x86_64]
+        arch: [x86_64, arm64]
 
     steps:
       - name: Checkout repo
@@ -43,7 +43,7 @@ jobs:
 
   create-universal:
     needs: build
-    runs-on: macos-14-arm64
+    runs-on: macos-latest
     steps:
       - name: Download x86_64 artifact
         uses: actions/download-artifact@v4
@@ -63,7 +63,7 @@ jobs:
           lipo -create -output universal/libvosk.dylib \
             x86_64/libvosk.dylib \
             arm64/libvosk.dylib
-          cp arm64/vosk_api.h universal/
+          cp x86_64/vosk_api.h universal/
 
       - name: Upload universal binary
         uses: actions/upload-artifact@v4
