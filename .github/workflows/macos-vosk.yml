@@ -26,12 +26,11 @@ jobs:
         run: |
           git clone --depth=1 https://github.com/alphacep/kaldi
           cd kaldi
-          git checkout vosk
           cd tools
           mkdir -p python
           ./extras/install_openblas.sh
           cd ../src
-          ./configure --mathlib=OPENBLAS --shared --use-cuda=no
+          ./configure --mathlib=OPENBLAS --shared --use-cuda=no --static-math=yes --static-fst=yes --fst-root=/usr/local/lib
           make -j$(sysctl -n hw.ncpu) clean depend
           make -j$(sysctl -n hw.ncpu)
           cd ../
