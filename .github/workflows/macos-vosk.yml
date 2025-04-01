@@ -6,18 +6,21 @@ on:
 jobs:
   build:
     name: Build on macOS
-    runs-on: macos-latest
+    runs-on: macos-14-arm64
+    strategy:
+      matrix:
+        arch: [x86_64, arm64]
 
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Install dependencies
         run: |
           brew install cmake swig
           python3 -m pip install numpy
 
-      - name: Clone vosk-api (if not in repo)
+      - name: Clone vosk-api
         run: |
           git clone --depth=1 https://github.com/alphacep/vosk-api.git vosk
 
@@ -25,13 +28,45 @@ jobs:
         run: |
           mkdir -p vosk/build
           cd vosk/build
-          cmake ..
+          cmake -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} ..
           make -j$(sysctl -n hw.ncpu)
+          mkdir -p ../../build-${{ matrix.arch }}
+          cp src/libvosk.dylib ../../build-${{ matrix.arch }}/
 
-      - name: Upload dylib artifact
-        uses: actions/upload-artifact@v3
+      - name: Upload architecture-specific dylib
+        uses: actions/upload-artifact@v4
         with:
-          name: libvosk-macos
+          name: libvosk-macos-${{ matrix.arch }}
           path: |
-            vosk/build/src/libvosk.dylib
+            build-${{ matrix.arch }}/libvosk.dylib
             vosk/src/vosk_api.h
+
+  create-universal:
+    needs: build
+    runs-on: macos-14-arm64
+    steps:
+      - name: Download x86_64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: libvosk-macos-x86_64
+          path: x86_64
+
+      - name: Download arm64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: libvosk-macos-arm64
+          path: arm64
+
+      - name: Create universal binary
+        run: |
+          mkdir -p universal
+          lipo -create -output universal/libvosk.dylib \
+            x86_64/libvosk.dylib \
+            arm64/libvosk.dylib
+          cp arm64/vosk_api.h universal/
+
+      - name: Upload universal binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: libvosk-macos-universal
+          path: universal/
