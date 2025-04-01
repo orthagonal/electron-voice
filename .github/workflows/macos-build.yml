@@ -17,7 +17,7 @@ jobs:
     runs-on: macos-latest
     strategy:
       matrix:
-        target: [x86_64-apple-darwin]
+        target: [x86_64-apple-darwin, aarch64-apple-darwin]
 
     steps:
     - uses: actions/checkout@v4
@@ -44,6 +44,7 @@ jobs:
       with:
         files: |
           Releases/libelectron_voice-x86_64-apple-darwin.dylib
+          Releases/libelectron_voice-aarch64-apple-darwin.dylib
         draft: true
         prerelease: false
       env:
