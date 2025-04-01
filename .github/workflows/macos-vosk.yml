@@ -17,10 +17,24 @@ jobs:
 
       - name: Install dependencies
         run: |
-          brew install cmake swig
+          brew install cmake swig automake sox libtool
           python3 -m venv .venv
           source .venv/bin/activate
           python3 -m pip install numpy
+
+      - name: Clone and build Kaldi
+        run: |
+          git clone --depth=1 https://github.com/alphacep/kaldi
+          cd kaldi
+          git checkout vosk
+          cd tools
+          mkdir -p python
+          ./extras/install_openblas.sh
+          cd ../src
+          ./configure --mathlib=OPENBLAS --shared --use-cuda=no
+          make -j$(sysctl -n hw.ncpu) clean depend
+          make -j$(sysctl -n hw.ncpu)
+          cd ../
 
       - name: Clone vosk-api
         run: |
@@ -31,7 +45,11 @@ jobs:
           source .venv/bin/activate
           mkdir -p vosk/build
           cd vosk/build
-          cmake -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} ..
+          KALDI_ROOT=$GITHUB_WORKSPACE/kaldi cmake \
+            -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DKALDI_ROOT=$GITHUB_WORKSPACE/kaldi \
+            ..
           make -j$(sysctl -n hw.ncpu)
           mkdir -p ../../build-${{ matrix.arch }}
           cp src/libvosk.dylib ../../build-${{ matrix.arch }}/
