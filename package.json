@@ -1,18 +1,39 @@
 {
-  "name": "voice",
+  "name": "electron-voice",
   "version": "0.1.0",
   "description": "",
-  "main": "index.node",
+  "main": "build/Release/electron-voice.node",
   "scripts": {
-    "build": "cargo-cp-artifact -nc index.node -- cargo build --message-format=json-render-diagnostics",
+    "build": "cargo build --release --target x86_64-pc-windows-msvc && if not exist build\\Release mkdir build\\Release && copy /Y \"target\\x86_64-pc-windows-msvc\\release\\electron_voice.dll\" \"build\\Release\\electron-voice.node\"",
+    "install": "npm run build",
+    "build-win": "cargo-cp-artifact -nc index.node -- cargo build --message-format=json-render-diagnostics",
+    "rebuild": "npx electron-rebuild -f -w voice",
     "build-debug": "npm run build --",
     "build-release": "npm run build -- --release",
-    "install": "npm run build-release",
     "test": "cargo test"
   },
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "Cargo.toml",
+    "src/",
+    "build/",
+    "target/",
+    "binaries/",
+    "libvosk.dll",
+    "binding.gyp",
+    "package.json"
+  ],
+  "gypfile": false,
   "author": "",
   "license": "ISC",
   "devDependencies": {
-    "cargo-cp-artifact": "^0.1"
+    "cargo-cp-artifact": "^0.1",
+    "electron-rebuild": "^3.2.9",
+    "neon-cli": "^0.10.1"
   }
 }

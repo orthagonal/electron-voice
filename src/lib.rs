@@ -95,11 +95,14 @@ this section defines functions that you can access from nodejs
 
 // returns a js array listing the audio devices on your system
 fn list_devices(mut cx: FunctionContext) -> JsResult<JsArray> {
+    println!("listing devices");
     let host = cpal::default_host();
     let devices = host.input_devices().expect("Failed to get input devices");
     let js_array = JsArray::new(&mut cx, 0);
     for (device_index, device) in devices.enumerate() {
         let name = device.name().unwrap();
+        let cloned_name = name.clone();
+        // println!("device: {:?}", cloned_name);
         let js_string = cx.string(name);
         js_array.set(&mut cx, device_index as u32, js_string)?;
     }
@@ -176,11 +179,14 @@ fn start_listener(mut cx: FunctionContext) -> JsResult<JsUndefined> {
         {
             let mut state = APP_STATE.lock();
             state.sample_rate = sample_rate;
+            // println!("Actual audio sample rate: {}", state.sample_rate);
             state.is_running = true;
         }
-        // println!("set to Sample rate: {:?}", sample_rate);
+        println!("set to sample rate: {:?}", sample_rate);
+        println!("sample format: {:?}", sample_format);
         let tx_clone = transmit_audio_channel.clone();
         let mut reported = false;
+        let channels = config.channels();
         let stream = device
             .build_input_stream(
                 &config.into(),
@@ -190,14 +196,21 @@ fn start_listener(mut cx: FunctionContext) -> JsResult<JsUndefined> {
                     }
                     // different audio devices use different ways of representing audio data
                     // a 32-bit float, a 16-bit signed integer, or a 16-bit unsigned integer
+                    // println!("sample format: {:?}", sample_format);
                     let data16 = match sample_format {
                         SampleFormat::F32 => convert_f32_to_16(data),
                         SampleFormat::I16 => convert_32_to_16(data),
                         SampleFormat::U16 => convert_32_to_16(data),
                         _ => panic!("Unsupported sample format"),
                     };
-                    let audio_data = convert_stereo_to_mono(&data16);
-                    tx_clone.send(audio_data).expect("Failed to send data");
+                    // println!("data16: {:?}", data16);
+                    if channels == 2 {
+                        let audio_data = convert_stereo_to_mono(&data16);
+                        tx_clone.send(audio_data).expect("Failed to send data");
+                    } else {
+                        let audio_data = data16;
+                        tx_clone.send(audio_data).expect("Failed to send data");
+                    }
                 },
                 move |err| {
                     eprintln!("Error during stream: {}", err);
@@ -311,20 +324,24 @@ fn convert_f32_to_16(input_data: &[f32]) -> Vec<i16> {
 }
 
 fn convert_32_to_16<T>(input_data: &[T]) -> Vec<i16>
-where
+    where
+
     T: Sample + ToSample<i16>,
 {
     input_data.iter().map(|v| v.to_sample()).collect()
 }
 
 fn  convert_stereo_to_mono(input_data: &[i16]) -> Vec<i16> {
+    if (input_data.len() % 2) != 0 {
+        println!("input_data is not even, returning original data");
+        return input_data.to_vec();
+    }
     let mut result = Vec::with_capacity(input_data.len() / 2);
     result.extend(
         input_data
             .chunks_exact(2)
             .map(|chunk| chunk[0] / 2 + chunk[1] / 2),
     );
-
     result
 }
 

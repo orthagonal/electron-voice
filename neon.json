@@ -1,0 +1,5 @@
+{
+  "crate": "electron-voice",
+  "neon_build_type": "release",
+  "lib": true
+}
