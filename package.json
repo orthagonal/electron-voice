@@ -10,7 +10,7 @@
     "rebuild": "npx electron-rebuild -f -w voice",
     "build-debug": "npm run build --",
     "build-release": "npm run build -- --release",
-    "test": "cargo test"
+    "test": "node scripts/test.cjs"
   },
   "os": [
     "win32"

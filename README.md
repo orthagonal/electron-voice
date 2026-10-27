@@ -8,6 +8,10 @@
 - can do generalized speech recognition
 - can take in a custom grammar to limit the recognized words
 
+Run `npm test` on Windows x64 for the regression suite without a microphone or
+recording. See [TESTING.md](TESTING.md) for coverage, prerequisites, and remaining
+integration checks.
+
 
 You can install the project with npm. In the project directory, run:
 

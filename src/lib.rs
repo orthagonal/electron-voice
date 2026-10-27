@@ -8,20 +8,34 @@ use std::ffi::{c_char, c_int, CStr, CString};
 // rust thread control stuff:
 use lazy_static::lazy_static;
 use parking_lot::Mutex;
-use std::sync::Mutex as StdMutex;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::thread;
 
 // audio input and processing stuff:
 use cpal::{
-    traits::{DeviceTrait, HostTrait, StreamTrait, },
-    SampleFormat
+    traits::{DeviceTrait, HostTrait, StreamTrait},
+    SampleFormat,
 };
 use dasp::{sample::ToSample, Sample};
+
+mod recognition;
+
+#[cfg(test)]
+mod tests;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct VoskPartialResult {
     partial: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct VoskTextResult {
+    text: String,
+}
+
+fn partial_is_only_the_tokens(words: &[String]) -> bool {
+    !words.is_empty() && words.iter().all(|word| word == "the")
 }
 
 // some vosk stubs
@@ -31,22 +45,22 @@ enum VoskRecognizer {}
 // controls the thread state:
 struct AppState {
     // audio device is selected and actively pulling in data:
-    is_running: bool, 
+    is_running: bool,
     // vosk model is loaded and ready to process audio:
     model_is_loaded: bool,
     // name of the audio device to listen to:
     name_of_mic: String,
-    // path to the vosk model file on disk 
+    // path to the vosk model file on disk
     // (see https://alphacephei.com/vosk/models)
     path_to_model: String,
     // optional, a grammar is a list of words to expect.
     // When you pass a grammar in, the model will only look for the words in that grammar.
-    // Use a grammar when you only need recognize a specific set of keywords 
-    // (i.e. you are implementing a voice user interface). 
+    // Use a grammar when you only need recognize a specific set of keywords
+    // (i.e. you are implementing a voice user interface).
     // Leave it blank to do general speech-to-text transcription.
     grammar: String,
-    // sample rate of the audio device, you have to know the sample_rate 
-    // before you can initialize the vosk voice recognizer 
+    // sample rate of the audio device, you have to know the sample_rate
+    // before you can initialize the vosk voice recognizer
     sample_rate: f32,
 }
 
@@ -70,9 +84,7 @@ struct WordsToLookFor {
 
 impl WordsToLookFor {
     fn new() -> Self {
-        WordsToLookFor {
-            is_active: true,
-        }
+        WordsToLookFor { is_active: true }
     }
 }
 
@@ -101,7 +113,7 @@ fn list_devices(mut cx: FunctionContext) -> JsResult<JsArray> {
     let js_array = JsArray::new(&mut cx, 0);
     for (device_index, device) in devices.enumerate() {
         let name = device.name().unwrap();
-        let cloned_name = name.clone();
+        // let cloned_name = name.clone();
         // println!("device: {:?}", cloned_name);
         let js_string = cx.string(name);
         js_array.set(&mut cx, device_index as u32, js_string)?;
@@ -217,14 +229,18 @@ fn start_listener(mut cx: FunctionContext) -> JsResult<JsUndefined> {
                 },
                 None,
             )
-           .unwrap();  
+            .unwrap();
         // start the consumer thread
-        // this thread takes in the audio from the producer thread and passes it through the 
+        // this thread takes in the audio from the producer thread and passes it through the
         // speech recognizer, then sends back any recognized words
         thread::spawn(move || {
             let (grammar, path_to_model, sample_rate) = {
                 let state = APP_STATE.lock();
-                (state.grammar.clone(), state.path_to_model.clone(), state.sample_rate)
+                (
+                    state.grammar.clone(),
+                    state.path_to_model.clone(),
+                    state.sample_rate,
+                )
             };
             let model = new_vosk_model(&path_to_model);
             // create  the speech recognizer, optionally use a grammar to only look for specific words
@@ -243,36 +259,39 @@ fn start_listener(mut cx: FunctionContext) -> JsResult<JsUndefined> {
             // some options for the model
             set_max_alternatives(recognizer, 1);
             set_words(recognizer, 1);
-    
-            while APP_STATE.lock().is_running {   
-                std::thread::sleep(std::time::Duration::from_secs(5));
+            let mut result_processor = recognition::RecognitionProcessor::default();
+
+            while APP_STATE.lock().is_running {
                 for data in &receive_audio_channel {
-                    // println!("Received audio data: {:?}", &data[..10]); 
+                    // println!("Received audio data: {:?}", &data[..10]);
                     // here is where we actually pass the audio waveform data to the voice recognizer
                     // we get the result back as a json string
-                    recognizer_accept_waveform_s(recognizer, &data);
-                    let result = recognizer_partial_result(recognizer);
-                    // println!("Partial result: {:?}", result);
-                    match serde_json::from_str::<VoskPartialResult>(&result) {
-                        Ok(json) => {
-                            // Successfully parsed JSON, now access `partial`
-                            // println!("Partial result: {:?}", json.partial);
-                            let listen_for_words = LISTEN_FOR_WORDS.lock().unwrap();
-                            let is_active = listen_for_words.is_active;
-                            if is_active {
-                                let words: Vec<String> = json.partial.split_whitespace().map(String::from).collect();
-                                transmit_words_channel.send(words.clone()).expect("Failed to send words");
-                                // println!("Words: {:?}", words);
-                                if words.len() > max_words {
-                                    reset_recognizer(recognizer);
-                                }
-                            }
-                        },
-                        Err(e) => {
-                            // Handle JSON parsing errors
-                            println!("Error parsing JSON: {}", e);
-                        }
+                    let utterance_complete = recognizer_accept_waveform_s(recognizer, &data);
+                    if !APP_STATE.lock().is_running {
+                        break;
                     }
+                    let listen_for_words = LISTEN_FOR_WORDS.lock().unwrap();
+                    let is_active = listen_for_words.is_active;
+                    drop(listen_for_words);
+                    if !is_active {
+                        continue;
+                    }
+                    let result = if utterance_complete {
+                        recognizer_result(recognizer)
+                    } else {
+                        recognizer_partial_result(recognizer)
+                    };
+                    result_processor.process(
+                        &result,
+                        utterance_complete,
+                        max_words,
+                        |words| {
+                            transmit_words_channel
+                                .send(words)
+                                .expect("Failed to send words")
+                        },
+                        || reset_recognizer(recognizer),
+                    );
                 }
             }
             let final_result = recognizer_result(recognizer);
@@ -284,7 +303,6 @@ fn start_listener(mut cx: FunctionContext) -> JsResult<JsUndefined> {
         while APP_STATE.lock().is_running {
             std::thread::sleep(std::time::Duration::from_millis(250));
             for wordlist in &receive_words_channel {
-                // println!("received wordlist {:?}", wordlist);
                 let cb_clone = Arc::clone(&all_words_callback_shared);
                 let ch_clone = Arc::clone(&channel_shared);
 
@@ -292,10 +310,10 @@ fn start_listener(mut cx: FunctionContext) -> JsResult<JsUndefined> {
                     let callback = cb_clone.to_inner(&mut cx);
                     let this = cx.undefined();
                     let mut args = vec![];
-                    let js_array = JsArray::new(&mut cx, wordlist.len() as usize); 
-                    for (i,word) in wordlist.iter().enumerate() {
+                    let js_array = JsArray::new(&mut cx, wordlist.len() as usize);
+                    for (i, word) in wordlist.iter().enumerate() {
                         let string = cx.string(word);
-                        js_array.set(&mut cx, i as u32, string).unwrap(); 
+                        js_array.set(&mut cx, i as u32, string).unwrap();
                     }
                     args.push(js_array.upcast::<JsValue>());
                     match callback.call(&mut cx, this, args) {
@@ -307,31 +325,32 @@ fn start_listener(mut cx: FunctionContext) -> JsResult<JsUndefined> {
                             // Optionally, you can transform this error into a JavaScript error
                             // cx.throw_error("Failed to call callback")
                         }
-                    }    
+                    }
                 });
             }
         }
         stream.pause().unwrap();
     });
 
-
     Ok(cx.undefined())
 }
 
 // fn that converts f32 to i16:
 fn convert_f32_to_16(input_data: &[f32]) -> Vec<i16> {
-    input_data.iter().map(|v| (v * i16::MAX as f32) as i16).collect()
+    input_data
+        .iter()
+        .map(|v| (v * i16::MAX as f32) as i16)
+        .collect()
 }
 
 fn convert_32_to_16<T>(input_data: &[T]) -> Vec<i16>
-    where
-
+where
     T: Sample + ToSample<i16>,
 {
     input_data.iter().map(|v| v.to_sample()).collect()
 }
 
-fn  convert_stereo_to_mono(input_data: &[i16]) -> Vec<i16> {
+fn convert_stereo_to_mono(input_data: &[i16]) -> Vec<i16> {
     if (input_data.len() % 2) != 0 {
         println!("input_data is not even, returning original data");
         return input_data.to_vec();
@@ -354,7 +373,7 @@ fn stop_listener(mut cx: FunctionContext) -> JsResult<JsUndefined> {
 }
 
 fn look_for_words(mut cx: FunctionContext) -> JsResult<JsUndefined> {
-    let mut words_to_look_for  = LISTEN_FOR_WORDS.lock().unwrap();
+    let mut words_to_look_for = LISTEN_FOR_WORDS.lock().unwrap();
     words_to_look_for.is_active = true;
     Ok(cx.undefined())
 }
@@ -409,7 +428,10 @@ extern "C" {
     ) -> i32;
     fn vosk_recognizer_result(recognizer: *mut VoskRecognizer) -> *const c_char;
     fn vosk_recognizer_partial_result(recognizer: *mut VoskRecognizer) -> *const c_char;
-    fn vosk_recognizer_set_max_alternatives(recognizer: *mut VoskRecognizer, max_alternatives: c_int) -> i32;
+    fn vosk_recognizer_set_max_alternatives(
+        recognizer: *mut VoskRecognizer,
+        max_alternatives: c_int,
+    ) -> i32;
     fn vosk_recognizer_set_words(recognizer: *mut VoskRecognizer, words: c_int) -> i32;
     fn vosk_recognizer_reset(recognizer: *mut VoskRecognizer);
 }
@@ -453,13 +475,9 @@ fn recognizer_new_grm(
     unsafe { vosk_recognizer_new_grm(model, sample_rate, c_grammar.as_ptr()) }
 }
 
-fn recognizer_accept_waveform_s(recognizer: *mut VoskRecognizer, data: &[i16]) {
-    unsafe {
-        let _result = vosk_recognizer_accept_waveform_s(recognizer, data.as_ptr(), data.len() as i32);
-        // println!("Accept waveform short result: {:?}", result)
-    }
+fn recognizer_accept_waveform_s(recognizer: *mut VoskRecognizer, data: &[i16]) -> bool {
+    unsafe { vosk_recognizer_accept_waveform_s(recognizer, data.as_ptr(), data.len() as i32) != 0 }
 }
-
 
 fn recognizer_result(recognizer: *mut VoskRecognizer) -> String {
     let c_result = unsafe { vosk_recognizer_result(recognizer) };
