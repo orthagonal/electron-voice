@@ -1,25 +1,18 @@
-// js binding stuff:
+//! Native speech recognition for Electron. JavaScript calls only configure or
+//! schedule work; one worker owns each environment's CPAL/Vosk resources.
+
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use neon::event::Channel;
 use neon::prelude::*;
-use neon::types::JsFunction;
-
-// c++ binding stuff for the vosk library:
-use std::ffi::{c_char, c_int, CStr, CString};
-
-// rust thread control stuff:
-use lazy_static::lazy_static;
 use parking_lot::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
-use std::thread;
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
-// audio input and processing stuff:
-use cpal::{
-    traits::{DeviceTrait, HostTrait, StreamTrait},
-    SampleFormat,
-};
-use dasp::{sample::ToSample, Sample};
-
+mod audio;
 mod recognition;
+mod vosk;
 
 #[cfg(test)]
 mod tests;
@@ -38,354 +31,510 @@ fn partial_is_only_the_tokens(words: &[String]) -> bool {
     !words.is_empty() && words.iter().all(|word| word == "the")
 }
 
-// some vosk stubs
-enum VoskModel {}
-enum VoskRecognizer {}
+#[derive(Default)]
+struct Session {
+    cancelled: Arc<AtomicBool>,
+    finished: AtomicBool,
+    pending_callbacks: AtomicUsize,
+}
 
-// controls the thread state:
-struct AppState {
-    // audio device is selected and actively pulling in data:
-    is_running: bool,
-    // vosk model is loaded and ready to process audio:
-    model_is_loaded: bool,
-    // name of the audio device to listen to:
-    name_of_mic: String,
-    // path to the vosk model file on disk
-    // (see https://alphacephei.com/vosk/models)
-    path_to_model: String,
-    // optional, a grammar is a list of words to expect.
-    // When you pass a grammar in, the model will only look for the words in that grammar.
-    // Use a grammar when you only need recognize a specific set of keywords
-    // (i.e. you are implementing a voice user interface).
-    // Leave it blank to do general speech-to-text transcription.
+impl Session {
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    fn is_done(&self) -> bool {
+        self.is_cancelled() || self.finished.load(Ordering::Acquire)
+    }
+}
+
+struct StartRequest {
+    session: Arc<Session>,
+    sink: Arc<JsSink>,
+    mic: String,
+    model: String,
     grammar: String,
-    // sample rate of the audio device, you have to know the sample_rate
-    // before you can initialize the vosk voice recognizer
+    max_words: usize,
+}
+
+struct AppState {
+    is_running: bool,
+    model_is_loaded: bool,
+    name_of_mic: String,
+    path_to_model: String,
+    grammar: String,
     sample_rate: f32,
+    current: Option<Arc<Session>>,
+    pending: Option<StartRequest>,
+    worker_running: bool,
+    worker: Option<JoinHandle<()>>,
+    closed: bool,
+    words: WordsToLookFor,
 }
 
 impl AppState {
     fn new() -> Self {
-        AppState {
+        Self {
             is_running: false,
             model_is_loaded: false,
-            name_of_mic: String::from("default"),
-            path_to_model: String::from(""),
-            grammar: String::from(""),
+            name_of_mic: "default".into(),
+            path_to_model: String::new(),
+            grammar: String::new(),
             sample_rate: 16000.0,
+            current: None,
+            pending: None,
+            worker_running: false,
+            worker: None,
+            closed: false,
+            words: WordsToLookFor::new(),
         }
+    }
+
+    fn begin(&mut self, session: Arc<Session>) -> bool {
+        if self.is_running || self.closed {
+            return false;
+        }
+        self.is_running = true;
+        self.model_is_loaded = false;
+        if let Some(previous) = self.current.take() {
+            previous.cancel();
+        }
+        self.current = Some(session);
+        true
+    }
+
+    fn owns(&self, session: &Arc<Session>) -> bool {
+        self.current
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, session))
+    }
+
+    fn ready(&mut self, session: &Arc<Session>, sample_rate: f32) -> bool {
+        if !self.owns(session) || session.is_cancelled() {
+            return false;
+        }
+        self.sample_rate = sample_rate;
+        self.model_is_loaded = true;
+        true
+    }
+
+    fn complete(&mut self, session: &Arc<Session>) -> bool {
+        session.finished.store(true, Ordering::Release);
+        if !self.owns(session) {
+            return false;
+        }
+        self.is_running = false;
+        self.model_is_loaded = false;
+        // Retain the last token until stop/restart so either operation can also
+        // suppress a failure notice that is still queued on the JS event loop.
+        true
+    }
+
+    fn stop(&mut self) {
+        if let Some(session) = self.current.take() {
+            session.cancel();
+        }
+        self.pending = None;
+        self.is_running = false;
+        self.model_is_loaded = false;
     }
 }
 
 struct WordsToLookFor {
-    // whether we're scanning for a word currently
     is_active: bool,
 }
 
 impl WordsToLookFor {
     fn new() -> Self {
-        WordsToLookFor { is_active: true }
+        Self { is_active: true }
     }
 }
 
-// the one true app state
-// these are the global variables that are shared between threads
-lazy_static! {
-    static ref APP_STATE: Mutex<AppState> = Mutex::new(AppState::new());
-    static ref LISTEN_FOR_WORDS: StdMutex<WordsToLookFor> = StdMutex::new(WordsToLookFor::new());
+// A Neon LocalKey is scoped to the JS environment, including Node workers.
+// Its destructor cancels capture on environment teardown without joining on JS.
+static ENVIRONMENT: neon::thread::LocalKey<Environment> = neon::thread::LocalKey::new();
+
+struct Environment(Arc<Mutex<AppState>>);
+
+impl Drop for Environment {
+    fn drop(&mut self) {
+        let mut state = self.0.lock();
+        state.closed = true;
+        state.stop();
+    }
 }
 
-/*
-     __          _       __  __    _____       _             __
-  /\ \ \___   __| | ___  \ \/ _\   \_   \_ __ | |_ ___ _ __ / _| __ _  ___ ___
- /  \/ / _ \ / _` |/ _ \  \ \ \     / /\| '_ \| __/ _ | '__| |_ / _` |/ __/ _ \
-/ /\  | (_) | (_| |  __/\_/ _\ \ /\/ /_ | | | | ||  __| |  |  _| (_| | (_|  __/
-\_\ \/ \___/ \__,_|\___\___/\__/ \____/ |_| |_|\__\___|_|  |_|  \__,_|\___\___|
+fn app_state<'a, C: Context<'a>>(cx: &mut C) -> Arc<Mutex<AppState>> {
+    Arc::clone(
+        &ENVIRONMENT
+            .get_or_init(cx, || Environment(Arc::new(Mutex::new(AppState::new()))))
+            .0,
+    )
+}
 
-this section defines functions that you can access from nodejs
-**************************************************************/
+struct JsSink {
+    callback: Arc<Root<JsFunction>>,
+    channel: Channel,
+}
 
-// returns a js array listing the audio devices on your system
+// Bounds Neon work if Electron temporarily stops servicing its event loop.
+// Backpressure happens only on the inference worker, never the audio callback.
+const MAX_PENDING_CALLBACKS: usize = 256;
+
+struct DeliveryPermit(Arc<Session>);
+
+impl Drop for DeliveryPermit {
+    fn drop(&mut self) {
+        self.0.pending_callbacks.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl JsSink {
+    fn words(&self, session: &Arc<Session>, words: Vec<String>) -> Result<(), String> {
+        while session.pending_callbacks.load(Ordering::Acquire) >= MAX_PENDING_CALLBACKS {
+            if session.is_done() {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        if session.is_done() {
+            return Ok(());
+        }
+        session.pending_callbacks.fetch_add(1, Ordering::AcqRel);
+        let permit = DeliveryPermit(Arc::clone(session));
+        let callback = Arc::clone(&self.callback);
+        self.channel
+            .try_send(move |mut cx| {
+                let _permit = permit;
+                if _permit.0.is_done() {
+                    return Ok(());
+                }
+                let callback = callback.to_inner(&mut cx);
+                let array = JsArray::new(&mut cx, words.len());
+                for (index, word) in words.iter().enumerate() {
+                    let word = cx.string(word);
+                    array.set(&mut cx, index as u32, word)?;
+                }
+                let this = cx.undefined();
+                if cx
+                    .try_catch(|cx| callback.call(cx, this, [array.upcast::<JsValue>()]))
+                    .is_err()
+                {
+                    emit_warning(
+                        &mut cx,
+                        "The speech-recognition callback threw an exception",
+                    )?;
+                }
+                Ok(())
+            })
+            .map_err(|_| {
+                "The JavaScript environment stopped accepting speech results".to_string()
+            })?;
+        Ok(())
+    }
+
+    fn warning(&self, session: &Arc<Session>, message: String) {
+        // Failed scheduling means the JS environment is closing. Cancellation
+        // and native cleanup must proceed without waiting for its event loop.
+        let session = Arc::clone(session);
+        let _ = self.channel.try_send(move |mut cx| {
+            if session.is_cancelled() {
+                return Ok(());
+            }
+            emit_warning(&mut cx, &message)
+        });
+    }
+}
+
+fn emit_warning<'a, C: Context<'a>>(cx: &mut C, message: &str) -> NeonResult<()> {
+    let process: Handle<JsObject> = cx.global("process")?;
+    let emit: Handle<JsFunction> = process.get(cx, "emitWarning")?;
+    let error = cx.error(message)?;
+    let code = cx.string("ELECTRON_VOICE_ERROR");
+    error.set(cx, "code", code)?;
+    emit.call(cx, process, [error.upcast::<JsValue>()])?;
+    Ok(())
+}
+
 fn list_devices(mut cx: FunctionContext) -> JsResult<JsArray> {
-    println!("listing devices");
-    let host = cpal::default_host();
-    let devices = host.input_devices().expect("Failed to get input devices");
-    let js_array = JsArray::new(&mut cx, 0);
-    for (device_index, device) in devices.enumerate() {
-        let name = device.name().unwrap();
-        // let cloned_name = name.clone();
-        // println!("device: {:?}", cloned_name);
-        let js_string = cx.string(name);
-        js_array.set(&mut cx, device_index as u32, js_string)?;
+    let devices = match cpal::default_host().input_devices() {
+        Ok(devices) => devices,
+        Err(error) => return cx.throw_error(format!("Could not enumerate microphones: {error}")),
+    };
+    let array = JsArray::new(&mut cx, 0);
+    for (index, device) in devices.enumerate() {
+        let name = match device.name() {
+            Ok(name) => name,
+            Err(error) => {
+                return cx.throw_error(format!("Could not read microphone name: {error}"))
+            }
+        };
+        let name = cx.string(name);
+        array.set(&mut cx, index as u32, name)?;
     }
-    Ok(js_array)
+    Ok(array)
 }
 
-// select an audio device to listen to
 fn set_mic_name(mut cx: FunctionContext) -> JsResult<JsUndefined> {
     let name = cx.argument::<JsString>(0)?.value(&mut cx);
-
-    {
-        let mut state = APP_STATE.lock();
-        state.name_of_mic = name;
-    }
-
+    app_state(&mut cx).lock().name_of_mic = name;
     Ok(cx.undefined())
 }
 
-// set the file path to the vosk speech model
 fn set_path_to_model(mut cx: FunctionContext) -> JsResult<JsUndefined> {
-    let name = cx.argument::<JsString>(0)?.value(&mut cx);
-    {
-        let mut state = APP_STATE.lock();
-        state.path_to_model = name;
-    }
-
+    let path = cx.argument::<JsString>(0)?.value(&mut cx);
+    app_state(&mut cx).lock().path_to_model = path;
     Ok(cx.undefined())
 }
 
-// grammar is a JSON array of words/phrases in string form  : "[\"hello world\", \"electron\", \"voice\"]"
 fn set_grammar(mut cx: FunctionContext) -> JsResult<JsUndefined> {
     let grammar = cx.argument::<JsString>(0)?.value(&mut cx);
-    {
-        let mut state = APP_STATE.lock();
-        state.grammar = grammar;
-    }
-
+    app_state(&mut cx).lock().grammar = grammar;
     Ok(cx.undefined())
 }
 
-// start the listening and interpreting threads
+fn validate_start(model: &str, grammar: &str, max_words: f64) -> Result<usize, String> {
+    // Preserve fractional-number truncation, while rejecting nonsensical casts.
+    if !max_words.is_finite() || max_words < 0.0 || max_words >= usize::MAX as f64 {
+        return Err(
+            "max_words must be a finite nonnegative number within the platform limit".into(),
+        );
+    }
+    if model.is_empty() || model.contains('\0') {
+        return Err("Set a nonempty model path without NUL bytes before startListener".into());
+    }
+    vosk::validate_grammar(grammar)?;
+    Ok(max_words as usize)
+}
+
 fn start_listener(mut cx: FunctionContext) -> JsResult<JsUndefined> {
-    // set up the audio
-    let desired_input_device_name = {
-        let state = APP_STATE.lock();
-        state.name_of_mic.clone()
+    // Validate JS argument types before creating roots, channels, or threads.
+    let callback = cx.argument::<JsFunction>(0)?;
+    let max_words = cx.argument::<JsNumber>(1)?.value(&mut cx);
+    let shared = app_state(&mut cx);
+    let mut state = shared.lock();
+    if state.is_running {
+        return Ok(cx.undefined()); // An active/starting listener is idempotent.
+    }
+    let max_words = match validate_start(&state.path_to_model, &state.grammar, max_words) {
+        Ok(value) => value,
+        Err(error) => return cx.throw_error(error),
     };
-    // one channel receives raw audio data, the other receives recognized words from that audio
-    let channel = cx.channel();
-    let (transmit_audio_channel, receive_audio_channel) = std::sync::mpsc::channel();
-    let (transmit_words_channel, receive_words_channel) = std::sync::mpsc::channel();
-
-    // js callback to call when words are found
-    let all_words_callback = cx.argument::<JsFunction>(0)?.root(&mut cx);
-    let max_words = cx.argument::<JsNumber>(1)?.value(&mut cx) as usize;
-
-    let all_words_callback_shared = Arc::new(all_words_callback);
-    let channel_shared = Arc::new(channel);
-
-    // start the producer thread, this thread opens and listens to your microphone
-    thread::spawn(move || {
-        let host = cpal::default_host();
-        let device = host
-            .input_devices()
-            .unwrap()
-            .find(|d| d.name().unwrap() == desired_input_device_name)
-            .or_else(|| host.default_input_device())
-            .expect("Failed to find a suitable input device");
-
-        let config = device.default_input_config().unwrap();
-        let sample_rate = config.sample_rate().0 as f32;
-        let sample_format = config.sample_format();
-        // send the audio sample rate to the other thread so it can create a matching speech recognizer
-        {
-            let mut state = APP_STATE.lock();
-            state.sample_rate = sample_rate;
-            // println!("Actual audio sample rate: {}", state.sample_rate);
-            state.is_running = true;
+    let session = Arc::new(Session::default());
+    if !state.begin(Arc::clone(&session)) {
+        return cx.throw_error("The speech-recognition environment is shutting down");
+    }
+    let mut channel = cx.channel();
+    channel.unref(&mut cx);
+    state.pending = Some(StartRequest {
+        session,
+        sink: Arc::new(JsSink {
+            callback: Arc::new(callback.root(&mut cx)),
+            channel,
+        }),
+        mic: state.name_of_mic.clone(),
+        model: state.path_to_model.clone(),
+        grammar: state.grammar.clone(),
+        max_words,
+    });
+    if !state.worker_running {
+        state.worker_running = true;
+        let previous = state.worker.take();
+        let worker_state = Arc::clone(&shared);
+        match thread::Builder::new()
+            .name("electron-voice".into())
+            .spawn(move || {
+                // Only a finishing worker can remain here; joining stays off JS.
+                if let Some(previous) = previous {
+                    let _ = previous.join();
+                }
+                worker_loop(worker_state);
+            }) {
+            Ok(worker) => state.worker = Some(worker),
+            Err(error) => {
+                state.stop();
+                state.worker_running = false;
+                return cx.throw_error(format!(
+                    "Could not start speech-recognition worker: {error}"
+                ));
+            }
         }
-        println!("set to sample rate: {:?}", sample_rate);
-        println!("sample format: {:?}", sample_format);
-        let tx_clone = transmit_audio_channel.clone();
-        let mut reported = false;
-        let channels = config.channels();
-        let stream = device
-            .build_input_stream(
-                &config.into(),
-                move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    if !reported {
-                        reported = true;
-                    }
-                    // different audio devices use different ways of representing audio data
-                    // a 32-bit float, a 16-bit signed integer, or a 16-bit unsigned integer
-                    // println!("sample format: {:?}", sample_format);
-                    let data16 = match sample_format {
-                        SampleFormat::F32 => convert_f32_to_16(data),
-                        SampleFormat::I16 => convert_32_to_16(data),
-                        SampleFormat::U16 => convert_32_to_16(data),
-                        _ => panic!("Unsupported sample format"),
-                    };
-                    // println!("data16: {:?}", data16);
-                    if channels == 2 {
-                        let audio_data = convert_stereo_to_mono(&data16);
-                        tx_clone.send(audio_data).expect("Failed to send data");
-                    } else {
-                        let audio_data = data16;
-                        tx_clone.send(audio_data).expect("Failed to send data");
-                    }
-                },
-                move |err| {
-                    eprintln!("Error during stream: {}", err);
-                },
-                None,
-            )
-            .unwrap();
-        // start the consumer thread
-        // this thread takes in the audio from the producer thread and passes it through the
-        // speech recognizer, then sends back any recognized words
-        thread::spawn(move || {
-            let (grammar, path_to_model, sample_rate) = {
-                let state = APP_STATE.lock();
-                (
-                    state.grammar.clone(),
-                    state.path_to_model.clone(),
-                    state.sample_rate,
-                )
-            };
-            let model = new_vosk_model(&path_to_model);
-            // create  the speech recognizer, optionally use a grammar to only look for specific words
-            let recognizer;
-            if grammar.len() == 0 {
-                recognizer = new_vosk_recognizer(model, sample_rate);
-            } else {
-                recognizer = recognizer_new_grm(model, sample_rate, &grammar);
-                println!("grammar loaded: {:?}", grammar);
-            }
-            // tell everyone else that the model is loaded and ready to roll
-            {
-                let mut state = APP_STATE.lock();
-                state.model_is_loaded = true;
-            }
-            // some options for the model
-            set_max_alternatives(recognizer, 1);
-            set_words(recognizer, 1);
-            let mut result_processor = recognition::RecognitionProcessor::default();
+    }
+    Ok(cx.undefined())
+}
 
-            while APP_STATE.lock().is_running {
-                for data in &receive_audio_channel {
-                    // println!("Received audio data: {:?}", &data[..10]);
-                    // here is where we actually pass the audio waveform data to the voice recognizer
-                    // we get the result back as a json string
-                    let utterance_complete = recognizer_accept_waveform_s(recognizer, &data);
-                    if !APP_STATE.lock().is_running {
-                        break;
-                    }
-                    let listen_for_words = LISTEN_FOR_WORDS.lock().unwrap();
-                    let is_active = listen_for_words.is_active;
-                    drop(listen_for_words);
-                    if !is_active {
-                        continue;
-                    }
-                    let result = if utterance_complete {
-                        recognizer_result(recognizer)
-                    } else {
-                        recognizer_partial_result(recognizer)
-                    };
-                    result_processor.process(
-                        &result,
-                        utterance_complete,
-                        max_words,
-                        |words| {
-                            transmit_words_channel
-                                .send(words)
-                                .expect("Failed to send words")
-                        },
-                        || reset_recognizer(recognizer),
-                    );
+fn worker_loop(shared: Arc<Mutex<AppState>>) {
+    loop {
+        let request = {
+            let mut state = shared.lock();
+            match state.pending.take() {
+                Some(request) => request,
+                None => {
+                    state.worker_running = false;
+                    return;
                 }
             }
-            let final_result = recognizer_result(recognizer);
-            println!("Final result: {:?}", final_result);
-        });
-        stream.play().unwrap();
-
-        // this is the loop that looks for recognized words and calls the js callback if found
-        while APP_STATE.lock().is_running {
-            std::thread::sleep(std::time::Duration::from_millis(250));
-            for wordlist in &receive_words_channel {
-                let cb_clone = Arc::clone(&all_words_callback_shared);
-                let ch_clone = Arc::clone(&channel_shared);
-
-                ch_clone.send(move |mut cx| {
-                    let callback = cb_clone.to_inner(&mut cx);
-                    let this = cx.undefined();
-                    let mut args = vec![];
-                    let js_array = JsArray::new(&mut cx, wordlist.len() as usize);
-                    for (i, word) in wordlist.iter().enumerate() {
-                        let string = cx.string(word);
-                        js_array.set(&mut cx, i as u32, string).unwrap();
-                    }
-                    args.push(js_array.upcast::<JsValue>());
-                    match callback.call(&mut cx, this, args) {
-                        Ok(_) => Ok(()),
-                        Err(e) => {
-                            // Handle the error, e.g., log it or send it back to JS
-                            println!("Error calling JavaScript callback: {:?}", e);
-                            Ok(())
-                            // Optionally, you can transform this error into a JavaScript error
-                            // cx.throw_error("Failed to call callback")
-                        }
-                    }
-                });
+        };
+        // Unwind Rust failures at the thread boundary so state is never stuck
+        // active. This cannot recover a process abort inside a native library.
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| listen(&shared, &request)))
+                .unwrap_or_else(|_| Err("Speech-recognition worker panicked".into()));
+        let was_cancelled = request.session.is_cancelled();
+        let was_current = shared.lock().complete(&request.session);
+        if !was_cancelled && was_current {
+            if let Err(error) = result {
+                request.sink.warning(&request.session, error);
             }
         }
-        stream.pause().unwrap();
-    });
-
-    Ok(cx.undefined())
-}
-
-// fn that converts f32 to i16:
-fn convert_f32_to_16(input_data: &[f32]) -> Vec<i16> {
-    input_data
-        .iter()
-        .map(|v| (v * i16::MAX as f32) as i16)
-        .collect()
-}
-
-fn convert_32_to_16<T>(input_data: &[T]) -> Vec<i16>
-where
-    T: Sample + ToSample<i16>,
-{
-    input_data.iter().map(|v| v.to_sample()).collect()
-}
-
-fn convert_stereo_to_mono(input_data: &[i16]) -> Vec<i16> {
-    if (input_data.len() % 2) != 0 {
-        println!("input_data is not even, returning original data");
-        return input_data.to_vec();
+        // All stream/Vosk resources have been dropped before the next request.
     }
-    let mut result = Vec::with_capacity(input_data.len() / 2);
-    result.extend(
-        input_data
-            .chunks_exact(2)
-            .map(|chunk| chunk[0] / 2 + chunk[1] / 2),
-    );
-    result
 }
 
-// stop the listening thread
-fn stop_listener(mut cx: FunctionContext) -> JsResult<JsUndefined> {
-    let mut state = APP_STATE.lock();
-    state.is_running = false;
+fn listen(shared: &Arc<Mutex<AppState>>, request: &StartRequest) -> Result<(), String> {
+    if request.session.is_cancelled() {
+        return Ok(());
+    }
+    // Snapshot configuration at start. Do not open capture while a large model
+    // loads; this prevents an initial backlog of stale audio.
+    if !std::path::Path::new(&request.model).is_dir() {
+        return Err(format!(
+            "Vosk model directory does not exist: {}",
+            request.model
+        ));
+    }
+    let model = vosk::Model::load(&request.model)?;
+    if request.session.is_cancelled() {
+        return Ok(());
+    }
+    let host = cpal::default_host();
+    let devices = host
+        .input_devices()
+        .map_err(|e| format!("Could not enumerate microphones: {e}"))?;
+    // Retain the existing fallback to the system default if a name is missing.
+    let device = devices
+        .filter_map(|device| device.name().ok().map(|name| (name, device)))
+        .find_map(|(name, device)| (name == request.mic).then_some(device))
+        .or_else(|| host.default_input_device())
+        .ok_or("No microphone is available")?;
+    let config = device
+        .default_input_config()
+        .map_err(|e| format!("Could not configure microphone: {e}"))?;
+    let sample_rate = config.sample_rate().0 as f32;
+    let mut recognizer = vosk::Recognizer::new(&model, sample_rate, &request.grammar)?;
+    if request.session.is_cancelled() {
+        return Ok(());
+    }
+    let (stream, input) = audio::open(&device, config, Arc::clone(&request.session.cancelled))?;
+    stream
+        .play()
+        .map_err(|e| format!("Could not start microphone: {e}"))?;
+    if !shared.lock().ready(&request.session, sample_rate) {
+        return Ok(());
+    }
+    let mut processor = recognition::RecognitionProcessor::default();
+    let mut warned_about_overflow = false;
+    let mut warned_about_result = false;
+    while !request.session.is_cancelled() {
+        if !warned_about_overflow && input.dropped.load(Ordering::Relaxed) > 0 {
+            warned_about_overflow = true;
+            request.sink.warning(&request.session, "Speech inference fell behind the two-second audio queue; some new audio was dropped".into());
+        }
+        let samples = match input.next(&request.session.cancelled)? {
+            Some(samples) => samples,
+            None => continue,
+        };
+        if request.session.is_cancelled() {
+            break;
+        }
+        let complete = recognizer.accept(&samples)?;
+        input.recycle(samples);
+        if request.session.is_cancelled() || !shared.lock().words.is_active {
+            continue;
+        }
+        let result = recognizer.result(complete)?;
+        let mut delivery = Ok(());
+        processor.process(
+            &result,
+            complete,
+            request.max_words,
+            |words| delivery = request.sink.words(&request.session, words),
+            || recognizer.reset(),
+        );
+        delivery?;
+        if let Some(error) = processor.take_error() {
+            // Keep partial recognition alive after malformed/native-schema
+            // errors. One warning per session avoids flooding Electron logs.
+            if !warned_about_result {
+                warned_about_result = true;
+                request.sink.warning(&request.session, error);
+            }
+        }
+    }
+    // Stream drops first (stopping callbacks), then recognizer, then model.
+    // Stop does not flush additional words into a cancelled game session.
+    drop(stream);
+    Ok(())
+}
 
+fn stop_listener(mut cx: FunctionContext) -> JsResult<JsUndefined> {
+    app_state(&mut cx).lock().stop();
     Ok(cx.undefined())
 }
 
 fn look_for_words(mut cx: FunctionContext) -> JsResult<JsUndefined> {
-    let mut words_to_look_for = LISTEN_FOR_WORDS.lock().unwrap();
-    words_to_look_for.is_active = true;
+    app_state(&mut cx).lock().words.is_active = true;
     Ok(cx.undefined())
 }
 
 fn is_model_loaded(mut cx: FunctionContext) -> JsResult<JsBoolean> {
-    let state = APP_STATE.lock();
-    Ok(JsBoolean::new(&mut cx, state.model_is_loaded))
+    let ready = app_state(&mut cx).lock().model_is_loaded;
+    Ok(cx.boolean(ready))
 }
 
-// all of the functions defined here are exposed to nodejs when you import this index.node module
-// eg:
-// const { setLogLevel, startListener, stopListener, listDevices, setMicName, setPathToModel, setSampleRate } = require('index.node');
+fn set_log_level(mut cx: FunctionContext) -> JsResult<JsUndefined> {
+    let level = cx.argument::<JsNumber>(0)?.value(&mut cx);
+    if !level.is_finite() || level < i32::MIN as f64 || level > i32::MAX as f64 {
+        return cx.throw_range_error("Log level must be a finite 32-bit number");
+    }
+    vosk::set_log_level(level as i32);
+    Ok(cx.undefined())
+}
+
+// Adapters retain the original vector helper contracts for characterization
+// tests; sample arithmetic is shared with the pooled live capture path.
+#[cfg(test)]
+fn convert_f32_to_16(input: &[f32]) -> Vec<i16> {
+    use audio::PcmSample;
+    input.iter().map(|sample| sample.pcm16()).collect()
+}
+
+#[cfg(test)]
+fn convert_32_to_16<T: cpal::Sample>(input: &[T]) -> Vec<i16>
+where
+    i16: cpal::FromSample<T>,
+{
+    input
+        .iter()
+        .map(|&sample| audio::convert_sample(sample))
+        .collect()
+}
+
+#[cfg(test)]
+fn convert_stereo_to_mono(input: &[i16]) -> Vec<i16> {
+    let (pairs, remainder) = input.as_chunks::<2>();
+    if !remainder.is_empty() {
+        return input.to_vec();
+    }
+    pairs
+        .iter()
+        .map(|pair| (audio::stereo_component(pair[0]) + audio::stereo_component(pair[1])) as i16)
+        .collect()
+}
 
 #[neon::main]
 fn main(mut cx: ModuleContext) -> NeonResult<()> {
@@ -399,94 +548,4 @@ fn main(mut cx: ModuleContext) -> NeonResult<()> {
     cx.export_function("isModelLoaded", is_model_loaded)?;
     cx.export_function("setGrammar", set_grammar)?;
     Ok(())
-}
-
-/*
-___    _____       _             __
-/ __\   \_   \_ __ | |_ ___ _ __ / _| __ _  ___ ___
-/ /       / /\| '_ \| __/ _ | '__| |_ / _` |/ __/ _ \
-/ /___  /\/ /_ | | | | ||  __| |  |  _| (_| | (_|  __/
-\____/  \____/ |_| |_|\__\___|_|  |_|  \__,_|\___\___|
-
-This section is bindings to the vosk dynamic library (.so on linux or .dll on windows)
-**************************************************************/
-
-extern "C" {
-    fn vosk_set_log_level(level: i32);
-    fn vosk_model_new(model_path: *const c_char) -> *mut VoskModel;
-    fn vosk_recognizer_new(model: *mut VoskModel, sample_rate: f32) -> *mut VoskRecognizer;
-    fn vosk_recognizer_new_grm(
-        model: *mut VoskModel,
-        sample_rate: f32,
-        grammar: *const c_char,
-    ) -> *mut VoskRecognizer;
-
-    fn vosk_recognizer_accept_waveform_s(
-        recognizer: *mut VoskRecognizer,
-        data: *const i16,
-        length: i32,
-    ) -> i32;
-    fn vosk_recognizer_result(recognizer: *mut VoskRecognizer) -> *const c_char;
-    fn vosk_recognizer_partial_result(recognizer: *mut VoskRecognizer) -> *const c_char;
-    fn vosk_recognizer_set_max_alternatives(
-        recognizer: *mut VoskRecognizer,
-        max_alternatives: c_int,
-    ) -> i32;
-    fn vosk_recognizer_set_words(recognizer: *mut VoskRecognizer, words: c_int) -> i32;
-    fn vosk_recognizer_reset(recognizer: *mut VoskRecognizer);
-}
-
-fn set_max_alternatives(recognizer: *mut VoskRecognizer, max_alternatives: c_int) -> i32 {
-    unsafe { vosk_recognizer_set_max_alternatives(recognizer, max_alternatives) }
-}
-
-fn set_words(recognizer: *mut VoskRecognizer, words: c_int) -> i32 {
-    unsafe { vosk_recognizer_set_words(recognizer, words) }
-}
-
-fn reset_recognizer(recognizer: *mut VoskRecognizer) {
-    unsafe { vosk_recognizer_reset(recognizer) }
-}
-
-// 'safe' wrappers for the vosk library
-fn set_log_level(mut cx: FunctionContext) -> JsResult<JsUndefined> {
-    let level: i32 = cx.argument::<JsNumber>(0)?.value(&mut cx) as i32;
-    unsafe {
-        vosk_set_log_level(level);
-    }
-    Ok(cx.undefined())
-}
-
-fn new_vosk_model(model_path: &str) -> *mut VoskModel {
-    let c_model_path = CString::new(model_path).expect("CString::new failed");
-    unsafe { vosk_model_new(c_model_path.as_ptr()) }
-}
-
-fn new_vosk_recognizer(model: *mut VoskModel, sample_rate: f32) -> *mut VoskRecognizer {
-    unsafe { vosk_recognizer_new(model, sample_rate) }
-}
-
-fn recognizer_new_grm(
-    model: *mut VoskModel,
-    sample_rate: f32,
-    grammar: &str,
-) -> *mut VoskRecognizer {
-    let c_grammar = CString::new(grammar).expect("CString::new failed");
-    unsafe { vosk_recognizer_new_grm(model, sample_rate, c_grammar.as_ptr()) }
-}
-
-fn recognizer_accept_waveform_s(recognizer: *mut VoskRecognizer, data: &[i16]) -> bool {
-    unsafe { vosk_recognizer_accept_waveform_s(recognizer, data.as_ptr(), data.len() as i32) != 0 }
-}
-
-fn recognizer_result(recognizer: *mut VoskRecognizer) -> String {
-    let c_result = unsafe { vosk_recognizer_result(recognizer) };
-    let result = unsafe { CStr::from_ptr(c_result) };
-    result.to_str().unwrap().to_string()
-}
-
-fn recognizer_partial_result(recognizer: *mut VoskRecognizer) -> String {
-    let c_result = unsafe { vosk_recognizer_partial_result(recognizer) };
-    let result = unsafe { CStr::from_ptr(c_result) };
-    result.to_str().unwrap().to_string()
 }

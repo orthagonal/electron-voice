@@ -3,6 +3,7 @@ name = "electron-voice"
 version = "0.1.0"
 license = "ISC"
 edition = "2021"
+rust-version = "1.88"
 exclude = ["index.node"]
 
 [lib]
@@ -15,8 +16,5 @@ cpal = "0.15.3"
 neon = "1"
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
-lazy_static = "1.4"
 parking_lot = "0.12.1"
-hound = "3.4.0"
-dasp = "0.11.0"
 

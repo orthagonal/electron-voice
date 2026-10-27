@@ -324,3 +324,147 @@ fn recognition_counters_are_independent_per_listener() {
     assert_eq!(first.partial("the", 25), [Event::Reset]);
     assert!(second.partial("the", 25).is_empty());
 }
+
+#[test]
+fn lifecycle_start_is_reserved_before_loading_and_duplicate_start_is_ignored() {
+    let mut state = AppState::new();
+    let first = Arc::new(Session::default());
+    assert!(state.begin(Arc::clone(&first)));
+    assert!(state.is_running);
+    assert!(!state.model_is_loaded);
+    assert!(!state.begin(Arc::new(Session::default())));
+    assert!(state.owns(&first));
+    assert!(state.ready(&first, 48000.0));
+    assert!(state.model_is_loaded);
+    assert_eq!(state.sample_rate, 48000.0);
+}
+
+#[test]
+fn lifecycle_stop_cancels_loading_and_running_sessions_and_is_idempotent() {
+    let mut state = AppState::new();
+    for ready in [false, true] {
+        let session = Arc::new(Session::default());
+        assert!(state.begin(Arc::clone(&session)));
+        if ready {
+            assert!(state.ready(&session, 16000.0));
+        }
+        state.stop();
+        state.stop();
+        assert!(session.is_cancelled());
+        assert!(!state.is_running);
+        assert!(!state.model_is_loaded);
+        assert!(!state.ready(&session, 16000.0));
+    }
+}
+
+#[test]
+fn stale_worker_completion_cannot_clear_a_replacement_listener() {
+    let mut state = AppState::new();
+    let old = Arc::new(Session::default());
+    assert!(state.begin(Arc::clone(&old)));
+    state.stop();
+    let replacement = Arc::new(Session::default());
+    assert!(state.begin(Arc::clone(&replacement)));
+    assert!(!state.ready(&old, 44100.0));
+    assert!(state.ready(&replacement, 48000.0));
+    assert!(!state.complete(&old));
+    assert!(state.is_running);
+    assert!(state.model_is_loaded);
+    assert_eq!(state.sample_rate, 48000.0);
+    assert!(state.complete(&replacement));
+    assert!(!state.is_running);
+    assert!(!state.model_is_loaded);
+}
+
+#[test]
+fn failed_initialization_can_be_followed_by_another_start() {
+    let mut state = AppState::new();
+    for _ in 0..100 {
+        let session = Arc::new(Session::default());
+        assert!(state.begin(Arc::clone(&session)));
+        assert!(state.complete(&session));
+        assert!(!state.is_running);
+        assert!(!state.model_is_loaded);
+    }
+}
+
+#[test]
+fn environment_shutdown_cancels_session_and_disallows_restart() {
+    let shared = Arc::new(Mutex::new(AppState::new()));
+    let session = Arc::new(Session::default());
+    assert!(shared.lock().begin(Arc::clone(&session)));
+    drop(Environment(Arc::clone(&shared)));
+    assert!(session.is_cancelled());
+    assert!(!shared.lock().begin(Arc::new(Session::default())));
+}
+
+#[test]
+fn invalid_configuration_is_rejected_before_native_initialization() {
+    for model in ["", "invalid\0path"] {
+        assert!(validate_start(model, "", 25.0).is_err());
+    }
+    for grammar in ["{", "{}", "null", "[42]", "[null]", "[\"hello\"]\0"] {
+        assert!(validate_start("model", grammar, 25.0).is_err());
+    }
+    for limit in [
+        -1.0,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+        usize::MAX as f64,
+    ] {
+        assert!(validate_start("model", "", limit).is_err());
+    }
+    assert_eq!(validate_start("model", "", 0.0).unwrap(), 0);
+    assert_eq!(
+        validate_start("model", "[\"hello\",\"世界\"]", 25.9).unwrap(),
+        25
+    );
+    assert_eq!(validate_start("model", "[]", 25.0).unwrap(), 25);
+}
+
+#[test]
+fn delivery_slots_are_released_when_queued_work_is_dropped() {
+    let session = Arc::new(Session::default());
+    session.pending_callbacks.store(1, Ordering::Release);
+    let permit = DeliveryPermit(Arc::clone(&session));
+    session.cancel();
+    drop(permit);
+    assert_eq!(session.pending_callbacks.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn completion_suppresses_words_but_stop_also_suppresses_failure_notices() {
+    let mut state = AppState::new();
+    let session = Arc::new(Session::default());
+    assert!(state.begin(Arc::clone(&session)));
+    assert!(state.complete(&session));
+    assert!(session.is_done());
+    assert!(!session.is_cancelled());
+    state.stop();
+    assert!(session.is_cancelled());
+}
+
+#[test]
+fn result_errors_are_recoverable_and_do_not_enable_alternative_callbacks() {
+    let mut processor = recognition::RecognitionProcessor::default();
+    processor.process(
+        r#"{"alternatives":[{"text":"hello"}]}"#,
+        true,
+        25,
+        |_| panic!("Existing final alternatives must not add new game callbacks"),
+        || panic!("Invalid result must not reset the recognizer"),
+    );
+    assert!(processor.take_error().is_some());
+    assert!(processor.take_error().is_none());
+    let mut words = Vec::new();
+    processor.process(
+        r#"{"partial":"hello"}"#,
+        false,
+        25,
+        |result| words = result,
+        || {},
+    );
+    assert_eq!(words, ["hello"]);
+    assert!(processor.take_error().is_none());
+}

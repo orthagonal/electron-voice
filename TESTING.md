@@ -1,70 +1,107 @@
 # Regression tests
 
-Run the complete suite from the repository root on Windows x64:
+Run the ordinary suite from the repository root:
 
 ```sh
 npm test
 ```
 
-You need Node.js (22 or newer), Rust with the
-`x86_64-pc-windows-msvc` target, and the MSVC build tools. The bundled Vosk DLLs
-must be present. No microphone, audio recording, speech model, or npm dependency
-installation is required. Cargo uses `Cargo.lock` and may download Rust
-dependencies on the first run.
+No microphone, recording, or speech model is required. Use Windows x64 with MSVC
+or Linux x64 GNU with ALSA development libraries, Node.js 22+, and Rust 1.88+.
+Bundled Vosk libraries must be available; the runner sets child-process DLL or
+library search paths. It does not change system settings. Cargo uses the lockfile
+and may download Rust dependencies on the first run.
 
-The runner in `scripts/test.cjs`:
+The runner executes `cargo test --locked`, builds the current release addon,
+copies it to the package entry point, and runs isolated JavaScript scenarios
+with a 10-second subprocess timeout. It always tests a fresh native binary.
 
-1. Adds the repository and bundled Windows Vosk directory to its child processes'
-   DLL search path without changing your system settings.
-2. Runs `cargo test --locked`.
-3. Builds the current release addon and copies it to the package entry point.
-4. Runs the JavaScript tests against that addon, with a fresh process and a
-   10-second timeout for each scenario.
+## Baseline and verification
 
-The Windows workflow in `.github/workflows/regression-tests.yml` runs the same
-command for pushes and pull requests.
+Before hardening: **25 Rust tests and 7 JavaScript tests passed**.
+The original test assertions have been retained; new tests are additive.
+
+After hardening, local Windows x64 verification with Node.js 25.1.0 and Rust
+1.99.0 produced:
+
+```text
+Rust:       52 passed; 0 failed; 0 ignored
+JavaScript: 13 passed; 0 failed; 0 skipped
+```
+
+Additional checks:
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
+npm run build
+```
+
+`cargo test --locked` is included in `npm test`. For a direct Windows invocation,
+put the repository and `binaries/vosk-win64-0.3.45` on that process's PATH first.
+The production Windows build command also handles an existing output directory.
+
+The CI workflow runs formatting, Clippy, Rust tests, and native API tests on
+Windows with Node 22/24 and Linux with Node 22. It also configures compile checks
+for both macOS architectures. CI changes were not remotely executed in this
+local session. Linux/macOS compilation and runtime behavior were not verified
+on this Windows host; matching toolchains and native Vosk libraries are required.
+The older macOS release workflow remains separate from these compile checks.
 
 ## Coverage
 
-| Tests | Behavior covered |
+| Source | Checks |
 | --- | --- |
-| `src/tests.rs`: audio | Float and integer scaling, clipping, silence, stereo averaging, integer limits, rounding, empty buffers, and the existing odd-length-buffer fallback |
-| `src/tests.rs`: recognition | Partial/final JSON parsing, Unicode and whitespace, extra metadata, invalid/empty results, repeated results, word-limit boundaries, emission before reset, and repeated `the` suppression/reset/recovery |
-| `tests/addon.test.cjs` | Loading through `package.json`, all nine API exports, initial readiness, setter argument types and return values, invalid listener arguments, and repeated idle stop/activation calls |
+| `src/tests.rs` | Original audio/recognition characterization tests; lifecycle reservation, duplicate starts, readiness, stop/restart, stale completion, teardown, configuration errors, delivery cleanup, and retained final-result policy |
+| `src/audio.rs` | Actual typed F32/I16/U16 capture, stereo rounding, partial channel frames, multichannel mixing, callback boundaries, bounded FIFO buffering/recovery, idle receive timeout, cancellation, channel disconnect, and device-error propagation |
+| `src/vosk.rs` | Unique native-handle cleanup on early return, null handles/results, UTF-8 handling, NUL paths, missing/incomplete model layouts, supported layout variants, and grammar validation |
+| `tests/addon.test.cjs` | The original nine exports and seven API scenarios, invalid configuration, asynchronous errors and retries, 100 rapid cancellations, process exit, and independent Node worker environments |
 
-Recognition tests supply JSON directly to the result handler used by the live
-listener. They record emitted word arrays and reset requests in order. They do
-not mock a second implementation of that handler.
+The original vector-helper tests use adapters around the live sample arithmetic.
+The capture tests additionally exercise the actual pooled callback path. Result
+handling tests drive the same processor used by the listener and observe word
+emissions and reset requests in order.
 
-These are characterization tests for the current working-tree behavior. For
-example, they preserve the current audio rounding, repeated partial emissions,
-strict `word_count > max_words` reset boundary, and partial counter behavior
-across empty or invalid results. An intentional behavior change should update
-the relevant expectation alongside a test reproducing the issue.
+Model layout fixtures contain placeholder bytes and are used **only** with the
+filesystem preflight. They are never passed into the native model constructor.
+The initial empty-directory constructor probe terminated the test process; its
+regression test now confirms the production wrapper rejects that input before
+calling native code. Pointer/destructor tests use uniquely owned test allocations
+with a matching destructor; they do not pretend to load a real Vosk model.
 
-## Baseline verification
+## Optional microphone smoke test
 
-Local verification on Windows x64 with Node.js 25.1.0:
+This is separate from `npm test`. With an existing compatible model and an
+available microphone, run in PowerShell:
 
-```text
-Rust:       25 passed; 0 failed; 0 ignored
-JavaScript:  7 passed; 0 failed; 0 skipped
+```powershell
+$env:ELECTRON_VOICE_TEST_MODEL = 'C:\models\vosk-model-small-en-us-0.15'
+npm run test:hardware
 ```
 
-The first 12 Rust helper tests and all seven API tests also passed before the
-recognition handler was extracted. Two temporary mutations in an isolated copy
-confirmed that the tests detect a reset threshold changed from 12 to 13 and a
-word-limit comparison changed from `>` to `>=`.
+Optionally set `ELECTRON_VOICE_TEST_MIC` and `ELECTRON_VOICE_TEST_GRAMMAR`.
+The test runs three actual start/ready/stop cycles, checks word-array shapes if
+speech occurs, and checks that callbacks stop after cancellation. Without the
+model environment variable, it is explicitly skipped. It was not run against
+hardware during this hardening session.
 
-## Remaining checks and existing issues
+## Manual Electron checks
 
-Real Vosk recognition and its actual result schema, audio-device selection and
-stream formats, asynchronous delivery into a JavaScript callback, and active
-listener stop/restart still need integration coverage. The current suite does
-not start audio threads or load a speech model.
+1. Test the production model/grammar and actual shipped Vosk DLLs in the game.
+   Verify command timing and repeated partials, including phrases containing
+   `the` and utterances above the word limit.
+2. Repeatedly start/stop during speech and during model loading. Immediately
+   restart and confirm readiness belongs to the newest session. Watch microphone
+   ownership and process memory over many cycles.
+3. Test default, named, and unavailable devices; unplug the active microphone,
+   observe `ELECTRON_VOICE_ERROR`, then reconnect and start again. Include available
+   F32/I16/U16 and multichannel hardware, not just the unit-test vectors.
+4. Pause or heavily load the game/event loop; verify bounded memory, useful
+   warning reporting, and acceptable recovery when inference or JS falls behind.
+5. Test package loading and shutdown in the actual Electron/Steam build. Node
+   subprocess tests do not establish Electron ABI/deployment correctness.
 
-The existing `npm run build` Windows command can skip copying the addon when
-`build/Release` already exists: its copy is inside a conditional command chain.
-This was observed while adding the package-loading tests. The regression runner
-builds and copies explicitly so it always tests a fresh addon. The production
-build script has not been changed; it remains a separate fix.
+Remaining limits: a native model load/inference call cannot be interrupted; a
+native abort cannot be caught by Rust; filesystem preflight does not validate
+model contents or prevent replacement races. The existing final `alternatives`
+behavior is deliberately retained to avoid adding duplicate game commands.
